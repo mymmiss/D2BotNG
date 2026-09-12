@@ -20,7 +20,12 @@ import {
   EnvVarsEditor,
   type EnvVar,
 } from "@/components/ui";
-import { PlusIcon, TrashIcon } from "@heroicons/react/24/outline";
+import {
+  ChevronDownIcon,
+  ChevronUpIcon,
+  PlusIcon,
+  TrashIcon,
+} from "@heroicons/react/24/outline";
 import { useFrameworks } from "@/stores/event-store";
 import type { FrameworkInput } from "@/hooks/useFrameworks";
 import type { Framework } from "@/generated/frameworks_pb";
@@ -100,6 +105,19 @@ export function FrameworkForm({
       setShared((prev) => ({ ...prev, ...partial }) as FrameworkInput),
     [],
   );
+
+  // Injection order matters (a later DLL may depend on an earlier one), so each
+  // row can be moved up/down. Swaps values rather than rows: the rows are keyed
+  // by index and the inputs are controlled, so no focus is lost.
+  const moveDll = useCallback((index: number, delta: -1 | 1) => {
+    setDllPaths((prev) => {
+      const target = index + delta;
+      if (target < 0 || target >= prev.length) return prev;
+      const next = [...prev];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  }, []);
 
   // Name must be non-empty and unique (case-insensitive), ignoring the framework
   // being edited.
@@ -194,6 +212,26 @@ export function FrameworkForm({
                       }
                     />
                   </div>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    aria-label="Move DLL up"
+                    disabled={index === 0}
+                    onClick={() => moveDll(index, -1)}
+                  >
+                    <ChevronUpIcon className="h-4 w-4" />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    aria-label="Move DLL down"
+                    disabled={index === dllPaths.length - 1}
+                    onClick={() => moveDll(index, 1)}
+                  >
+                    <ChevronDownIcon className="h-4 w-4" />
+                  </Button>
                   <Button
                     type="button"
                     variant="ghost"
