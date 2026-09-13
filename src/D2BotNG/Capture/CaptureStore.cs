@@ -106,12 +106,26 @@ public sealed partial class CaptureStore : IDisposable
 
                 try
                 {
-                    _connection = Connect(path);
+                    _connection = ConnectWaitingForLock(path);
+                }
+                catch (SqliteException ex) when (IsLocked(ex))
+                {
+                    // A LOCKED file is not a broken one. This is the in-place update: the
+                    // predecessor holds the database open (the capture store is outside the
+                    // handoff's write gate) until it has finished stopping, and a schema upgrade
+                    // is the one open that needs the write lock while it is still there. Deleting
+                    // the file here would throw away the lifetime totals the upgrade exists to
+                    // keep, so captures stay off for this run instead — the file is intact for
+                    // the next start.
+                    Discard();
+                    _logger.LogError(ex, "Captures are disabled: {Path} stayed locked by another process", path);
                 }
                 catch (Exception ex)
                 {
                     // A file we cannot read is derived state we can rebuild, so trade it for a
                     // working store rather than leaving captures broken until someone intervenes.
+                    // (An OLDER file was backed up before its upgrade was attempted, so what is
+                    // discarded here is recoverable by hand.)
                     _logger.LogWarning(ex, "Could not open {Path}; recreating it", path);
                     TryRecreate(path);
                 }
@@ -163,6 +177,37 @@ public sealed partial class CaptureStore : IDisposable
     }.ToString();
 
     /// <summary>
+    /// How long an open keeps trying while another process holds the write lock, in attempts of
+    /// the connection's own busy timeout (5s each — see CaptureSchema.TryUpgrade). Sized for the
+    /// in-place update: the predecessor releases the file once its capture engine has stopped,
+    /// which follows within seconds of the successor being adopted.
+    /// </summary>
+    private const int OpenAttempts = 6;
+
+    /// <summary>SQLITE_BUSY (5) or SQLITE_LOCKED (6): someone else has the file, and it is fine.</summary>
+    private static bool IsLocked(SqliteException ex) => ex.SqliteErrorCode is 5 or 6;
+
+    /// <summary>
+    /// <see cref="Connect" />, retried while the file is merely locked. Anything else propagates
+    /// on the first throw, since waiting changes nothing about a file that cannot be read.
+    /// </summary>
+    private SqliteConnection ConnectWaitingForLock(string path)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return Connect(path);
+            }
+            catch (SqliteException ex) when (IsLocked(ex) && attempt < OpenAttempts)
+            {
+                _logger.LogInformation("{Path} is locked by another process (attempt {Attempt}); waiting", path,
+                    attempt);
+            }
+        }
+    }
+
+    /// <summary>
     /// Opens a connection and brings the schema up to date, rebuilding the file when it was
     /// written by a newer build (whose shape this one cannot read).
     /// </summary>
@@ -172,7 +217,7 @@ public sealed partial class CaptureStore : IDisposable
         try
         {
             connection.Open();
-            if (CaptureSchema.TryUpgrade(connection)) return connection;
+            if (CaptureSchema.TryUpgrade(connection, _logger)) return connection;
         }
         catch
         {
@@ -183,9 +228,10 @@ public sealed partial class CaptureStore : IDisposable
         }
 
         connection.Dispose();
-        // Either direction: a file from an older build is discarded as readily as one from a newer
-        // build, because captures are derived state and re-reported within minutes.
-        _logger.LogWarning("{Path} is at another schema version; recreating it", path);
+        // Only a NEWER file lands here — an older one was just migrated in place, keeping its
+        // accumulated kills and area time. This build cannot know a newer shape, and captures are
+        // re-reported within minutes, so it is discarded.
+        _logger.LogWarning("{Path} was written by a newer version; recreating it", path);
         Delete(path);
 
         var fresh = new SqliteConnection(ConnectionString(path));
@@ -690,13 +736,15 @@ public sealed partial class CaptureStore : IDisposable
 
         // The stash is a list of pages, not a container — one row each, sharing the storage shape
         // with the others because a page IS a grid of items even though its holder is not.
+        // The whole stash arrives at once — every kind, every page — so clearing by name takes
+        // both kinds with it, and a shared page that disappeared is not left behind.
         if (containers.Stash != null)
         {
             Clear(CaptureSchema.ContainerStash);
             foreach (var page in containers.Stash.Pages)
             {
-                Insert(CaptureSchema.ContainerStash, page.Name, page.Index, page.Width, page.Height,
-                    page.Items, false);
+                Insert(CaptureSchema.ContainerStash, page.Name, page.Kind, page.Type, page.Index, page.Gold,
+                    page.Width, page.Height, page.Items, false);
             }
         }
 
@@ -711,7 +759,8 @@ public sealed partial class CaptureStore : IDisposable
             // cannot lay out and no way to discover the dimensions they came from.
             var width = slotIndexed && container.Width <= 0 ? DefaultBeltWidth : container.Width;
             var height = slotIndexed && container.Height <= 0 ? DefaultBeltHeight : container.Height;
-            Insert(name, "", 0, width, height, container.Items, slotIndexed);
+            Insert(name, "", StashTabKind.Personal, StashTabType.Normal, 0, 0, width, height, container.Items,
+                slotIndexed);
         }
 
         // A container arrives only when its contents changed, and it arrives whole, so everything
@@ -720,22 +769,25 @@ public sealed partial class CaptureStore : IDisposable
             ExecutePrepared("DELETE FROM container WHERE profile = $p AND owner = $o AND name = $n",
                 transaction, ("$p", profile), ("$o", owner), ("$n", name));
 
-        void Insert(string name, string label, int page, int width, int height,
-            IEnumerable<Unit> items, bool slotIndexed)
+        void Insert(string name, string label, StashTabKind stashKind, StashTabType stashType, int page,
+            uint gold, int width, int height, IEnumerable<Unit> items, bool slotIndexed)
         {
             // OR REPLACE for the same reason as ReplaceStats, and here the hazard is closer: the
-            // stash inserts one row per page under a UNIQUE(profile, owner, name, page), so two
-            // pages arriving with the same index would otherwise abort the whole snapshot —
-            // identity, kills and area time with it — and keep doing so on every later send.
-            // The superseded row cascades its items away, which is the right outcome: last wins.
+            // stash inserts one row per page under a UNIQUE(profile, owner, name, stash_kind, page),
+            // so two pages arriving with the same kind and index would otherwise abort the whole
+            // snapshot — identity, kills and area time with it — and keep doing so on every later
+            // send. The superseded row cascades its items away, which is the right outcome: last
+            // wins.
             var containerId = InsertReturningId(
                 """
-                INSERT OR REPLACE INTO container (profile, owner, name, label, page, width, height)
-                VALUES ($p, $o, $n, $l, $pg, $w, $h)
+                INSERT OR REPLACE INTO container
+                    (profile, owner, name, label, stash_kind, stash_type, page, gold, width, height)
+                VALUES ($p, $o, $n, $l, $k, $t, $pg, $g, $w, $h)
                 RETURNING id
                 """,
                 transaction, ("$p", profile), ("$o", owner), ("$n", name), ("$l", label),
-                ("$pg", page), ("$w", width), ("$h", height));
+                ("$k", (int)stashKind), ("$t", (int)stashType), ("$pg", page), ("$g", (long)gold),
+                ("$w", width), ("$h", height));
 
             InsertItems(new ItemTarget(containerId, profile, transaction), items, width, height,
                 slotIndexed);

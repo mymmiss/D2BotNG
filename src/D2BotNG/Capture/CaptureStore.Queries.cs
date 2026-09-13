@@ -181,7 +181,7 @@ public sealed partial class CaptureStore
 
             using (var command = Command(
                        $"""
-                        {sql.Ctes}SELECT i.id, i.profile, c.owner, c.name, c.page
+                        {sql.Ctes}SELECT i.id, i.profile, c.owner, c.name, c.stash_kind, c.label, c.page
                           FROM item i
                           JOIN container c ON c.id = i.container_id{sql.OrderJoin}
                          WHERE {sql.Where}
@@ -197,7 +197,9 @@ public sealed partial class CaptureStore
                         Profile = reader.GetString(1),
                         Owner = (Owner)reader.GetInt32(2),
                         Container = reader.GetString(3),
-                        Page = reader.GetInt32(4),
+                        StashKind = (StashTabKind)reader.GetInt32(4),
+                        StashName = reader.GetString(5),
+                        Page = reader.GetInt32(6),
                     }));
                 }
             }
@@ -341,18 +343,21 @@ public sealed partial class CaptureStore
         // per-wearer call costs a container query plus ReadItemTree's three, so a character with a
         // mercenary would take eight queries where four do — all of them holding the store's lock
         // against ingest, on the path the UI refetches from.
-        var rows = new List<(long Id, int Owner, string Name, string Label, int Page, int Width, int Height)>();
+        var rows = new List<(long Id, int Owner, string Name, string Label, int StashKind, int StashType,
+            int Page, long Gold, int Width, int Height)>();
         using (var command = Command(
                    """
-                   SELECT id, owner, name, label, page, width, height FROM container
-                    WHERE profile = $p ORDER BY owner, name, page
+                   SELECT id, owner, name, label, stash_kind, stash_type, page, gold, width, height
+                     FROM container
+                    WHERE profile = $p ORDER BY owner, name, stash_kind, page
                    """, null, ("$p", character.Profile)))
         {
             using var reader = command.ExecuteReader();
             while (reader.Read())
             {
                 rows.Add((reader.GetInt64(0), reader.GetInt32(1), reader.GetString(2), reader.GetString(3),
-                    reader.GetInt32(4), reader.GetInt32(5), reader.GetInt32(6)));
+                    reader.GetInt32(4), reader.GetInt32(5), reader.GetInt32(6), reader.GetInt64(7),
+                    reader.GetInt32(8), reader.GetInt32(9)));
             }
         }
 
@@ -376,7 +381,7 @@ public sealed partial class CaptureStore
         character.Player.Containers = new Containers();
         if (character.Merc != null) character.Merc.Containers = new Containers();
 
-        foreach (var (id, owner, name, label, page, width, height) in rows)
+        foreach (var (id, owner, name, label, stashKind, stashType, page, gold, width, height) in rows)
         {
             // Null for a merc that has no row, which drops its orphaned containers — the same
             // rule Populate applies to orphaned stats and skills.
@@ -405,8 +410,11 @@ public sealed partial class CaptureStore
                     // the rows become pages under it rather than one of them becoming the stash.
                     (containers.Stash ??= new Stash()).Pages.Add(new StashPage
                     {
+                        Kind = (StashTabKind)stashKind,
                         Index = page,
+                        Type = (StashTabType)stashType,
                         Name = label,
+                        Gold = (uint)gold,
                         Width = width,
                         Height = height,
                         Items = { items },

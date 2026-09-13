@@ -1175,17 +1175,15 @@ public class CaptureStoreTests : IDisposable
     }
 
     /// <summary>
-    /// The rule is "any version that is not this one", not "any newer one" — deleting the
-    /// migration chain made those the same code path. Both cases are above
-    /// <see cref="CaptureSchema.Version" /> because at version 1 nothing can be below it: 0 is
-    /// reserved for a file with no schema yet, which is created rather than discarded. The
-    /// adjacent value is the one that carries the test — a version check gone off by one would
-    /// pass 999 and fail here.
+    /// A file from a NEWER build is recreated: this build cannot know its shape. Both cases are
+    /// above <see cref="CaptureSchema.Version" />; the adjacent value is the one that carries the
+    /// test — a version check gone off by one would pass 999 and fail here. (An OLDER file is the
+    /// other path, migrated rather than discarded — see the test below.)
     /// </summary>
     [Theory]
-    [InlineData(2)]
+    [InlineData(CaptureSchema.Version + 1)]
     [InlineData(999)]
-    public void ADatabaseAtAnotherSchemaVersionIsRecreatedAndKeepsWorking(int version)
+    public void ADatabaseFromANewerVersionIsRecreatedAndKeepsWorking(int version)
     {
         Apply(Keyframe());
         _store.Dispose();
@@ -1199,10 +1197,94 @@ public class CaptureStoreTests : IDisposable
     }
 
     /// <summary>
-    /// Stamps a schema version other than this build's. Pooling is off so this helper cannot be
-    /// the thing holding the file open when the store tries to replace it.
+    /// A version-1 file is upgraded in place and keeps everything: the items (whose rows reference
+    /// the rebuilt container table by id), the kills and area time (which nothing re-reports), and
+    /// its stash pages, which come back as personal/normal pages — the only kind a version-1
+    /// producer could have sent.
+    ///
+    /// The fixture is built by downgrading a current file to the version-1 shape rather than from
+    /// a checked-in copy, because the one thing that changed between the versions is the container
+    /// table, and rebuilding just that table is a faithful version-1 file: every other table is
+    /// byte-for-byte what version 1 wrote.
     /// </summary>
-    private static void SetUserVersion(string path, int version)
+    [Fact]
+    public void AVersionOneDatabaseIsMigratedAndKeepsItsRows()
+    {
+        Apply(Keyframe());
+        // A kill delta after the keyframe, so the total is something accumulated rather than
+        // something a re-report would restore.
+        Apply("""
+              {"schemaVersion":2,"gameId":"Game#1","updatedAt":1717000010000,
+               "kills":{"byClass":[{"id":58,"spec":2,"count":4}]}}
+              """);
+        _store.Dispose();
+        DowngradeContainerTableToVersionOne(DatabasePath);
+
+        using var reopened = new CaptureStore(NullLogger<CaptureStore>.Instance, new Paths(_directory), _tooltip);
+        reopened.Open();
+
+        var character = reopened.GetCharacter("Bot1")!;
+        Assert.Equal("Sorc", character.Player.Name);
+        Assert.Single(character.Player.Containers.Inventory.Items);
+        var page = Assert.Single(character.Player.Containers.Stash.Pages);
+        Assert.Equal(StashTabKind.Personal, page.Kind);
+        Assert.Equal(StashTabType.Normal, page.Type);
+        Assert.Equal(0u, page.Gold);
+        Assert.Equal("rin", Assert.Single(page.Items).Code);
+        Assert.Equal(7, character.Kills.Single(k => k.Id == 58 && !k.SuperUnique).Count);
+
+        // The original was set aside first, the way the JSON repositories do it.
+        Assert.True(File.Exists(BackupPath(1)), "captures.v1.bak was not written before the upgrade");
+
+        // And the upgraded file takes the new shape: a shared page beside the personal one.
+        reopened.Apply("Bot1", Parse(TwoKindStash()));
+        Assert.Equal(2, reopened.GetCharacter("Bot1")!.Player.Containers.Stash.Pages.Count);
+    }
+
+    /// <summary>
+    /// A step that fails leaves the file exactly as it was — still at its old version, every row
+    /// intact — and the backup already taken. The store's caller then recreates the file, so the
+    /// rollback is what makes the backup a complete copy rather than a half-converted one.
+    ///
+    /// The failure is provoked by a stray table with the name the step creates, so CREATE TABLE
+    /// fails on the first statement; nothing about the store is stubbed.
+    /// </summary>
+    [Fact]
+    public void AFailedMigrationStepLeavesTheFileUntouched()
+    {
+        Apply(Keyframe());
+        _store.Dispose();
+        DowngradeContainerTableToVersionOne(DatabasePath);
+        ExecuteRaw(DatabasePath, "CREATE TABLE container_v2 (x INTEGER)");
+        var items = ScalarRaw(DatabasePath, "SELECT COUNT(*) FROM item");
+        Assert.True(items > 0);
+
+        using (var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+        {
+            DataSource = DatabasePath,
+            Pooling = false,
+        }.ToString()))
+        {
+            connection.Open();
+            Assert.ThrowsAny<Exception>(() => CaptureSchema.TryUpgrade(connection));
+
+            // Per connection, so it has to be asked of the one the upgrade ran on: the rollback
+            // path must switch enforcement back on, or every later delete on this connection
+            // would leave orphans.
+            using var pragma = connection.CreateCommand();
+            pragma.CommandText = "PRAGMA foreign_keys";
+            Assert.Equal(1L, Convert.ToInt64(pragma.ExecuteScalar()));
+        }
+
+        Assert.Equal(1L, ScalarRaw(DatabasePath, "PRAGMA user_version"));
+        Assert.Equal(items, ScalarRaw(DatabasePath, "SELECT COUNT(*) FROM item"));
+        Assert.True(File.Exists(BackupPath(1)));
+        Assert.Equal(items, ScalarRaw(BackupPath(1), "SELECT COUNT(*) FROM item"));
+    }
+
+    private string BackupPath(int version) => Path.ChangeExtension(DatabasePath, $".v{version}.bak");
+
+    private static void ExecuteRaw(string path, string sql)
     {
         using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
         {
@@ -1211,9 +1293,119 @@ public class CaptureStoreTests : IDisposable
         }.ToString());
         connection.Open();
         using var command = connection.CreateCommand();
-        command.CommandText = $"PRAGMA user_version = {version}";
+        command.CommandText = sql;
         command.ExecuteNonQuery();
     }
+
+    private static long ScalarRaw(string path, string sql)
+    {
+        using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+        {
+            DataSource = path,
+            Mode = SqliteOpenMode.ReadOnly,
+            Pooling = false,
+        }.ToString());
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        return Convert.ToInt64(command.ExecuteScalar());
+    }
+
+    [Fact]
+    public void StashPagesOfBothKindsRoundTripWithTheirIdentity()
+    {
+        Apply(TwoKindStash());
+
+        var pages = _store.GetCharacter("Bot1")!.Player.Containers.Stash.Pages;
+        // Personal 0 and shared 0 are different pages: the kind is part of the key.
+        Assert.Equal(2, pages.Count);
+
+        var personal = pages.Single(p => p.Kind == StashTabKind.Personal);
+        Assert.Equal(0, personal.Index);
+        Assert.Equal(StashTabType.Normal, personal.Type);
+        Assert.Equal("", personal.Name);
+        Assert.Equal(2500000u, personal.Gold);
+        Assert.Equal("rin", Assert.Single(personal.Items).Code);
+
+        var shared = pages.Single(p => p.Kind == StashTabKind.Shared);
+        Assert.Equal(0, shared.Index);
+        Assert.Equal(StashTabType.AdvancedStash, shared.Type);
+        Assert.Equal("Runes", shared.Name);
+        Assert.Equal(0u, shared.Gold);
+        Assert.Empty(shared.Items);
+
+        // A search result says which stash it found the item in.
+        var found = _store.SearchItems(new SearchItemsRequest { Containers = { "stash" } });
+        var match = Assert.Single(found.Results);
+        Assert.Equal(StashTabKind.Personal, match.StashKind);
+        Assert.Equal(0, match.Page);
+    }
+
+    /// <summary>
+    /// An engine from before stash kinds sends pages with no kind, type or gold. Those parse as
+    /// the zero values, which mean personal, normal and none — the vanilla tab such an engine was
+    /// reporting — so nothing has to detect the old shape.
+    /// </summary>
+    [Fact]
+    public void APageFromAnOlderProducerIsAPersonalNormalPage()
+    {
+        Apply(Keyframe()); // its stash page carries only index/name/width/height/items
+
+        var page = Assert.Single(_store.GetCharacter("Bot1")!.Player.Containers.Stash.Pages);
+        Assert.Equal(StashTabKind.Personal, page.Kind);
+        Assert.Equal(StashTabType.Normal, page.Type);
+        Assert.Equal(0u, page.Gold);
+    }
+
+    /// <summary>A stash with a personal and a shared page, both at index 0.</summary>
+    private static string TwoKindStash() =>
+        """
+        {"schemaVersion":2,"gameId":"Game#1","keyframe":true,"updatedAt":1717000000000,
+         "player":{"name":"Sorc","containers":{"stash":{"pages":[
+           {"kind":0,"index":0,"type":0,"name":"","gold":2500000,"width":6,"height":8,"items":[
+             {"unitType":4,"classId":522,"code":"rin","quality":4,"itemFlags":0,"format":0,
+              "fileIndex":-1,"itemLevel":50,"rarePrefix":0,"rareSuffix":0,"autoAffix":0,
+              "magicPrefix":[0,0,0],"magicSuffix":[0,0,0],"earLevel":0,"playerName":"","gfxIndex":2,
+              "title":"Ring of the Apprentice",
+              "statsLists":[{"stateNo":0,"flags":1,"stats":[{"id":7,"value":50}]}],
+              "gid":1004,"location":7,"x":1,"y":2,"w":1,"h":1}]},
+           {"kind":1,"index":0,"type":1,"name":"Runes","gold":0,"width":6,"height":8,"items":[]}
+         ]}}}}
+        """;
+
+    /// <summary>
+    /// Rebuilds `container` in its version-1 shape (no stash columns, the narrower key) and stamps
+    /// the file as version 1. Foreign keys off for the same reason the migration needs them off:
+    /// dropping the table with them on would cascade every item away.
+    /// </summary>
+    private static void DowngradeContainerTableToVersionOne(string path) =>
+        ExecuteRaw(path,
+            """
+            PRAGMA foreign_keys = OFF;
+            CREATE TABLE container_v1 (
+                id       INTEGER PRIMARY KEY,
+                profile  TEXT    NOT NULL REFERENCES character(profile) ON DELETE CASCADE,
+                owner    INTEGER NOT NULL,
+                name     TEXT    NOT NULL,
+                label    TEXT    NOT NULL DEFAULT '',
+                page     INTEGER NOT NULL DEFAULT 0,
+                width    INTEGER NOT NULL DEFAULT 0,
+                height   INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (profile, owner, name, page)
+            ) STRICT;
+            INSERT INTO container_v1 (id, profile, owner, name, label, page, width, height)
+            SELECT id, profile, owner, name, label, page, width, height FROM container;
+            DROP TABLE container;
+            ALTER TABLE container_v1 RENAME TO container;
+            PRAGMA user_version = 1;
+            """);
+
+    /// <summary>
+    /// Stamps a schema version other than this build's. Pooling is off so this helper cannot be
+    /// the thing holding the file open when the store tries to replace it.
+    /// </summary>
+    private static void SetUserVersion(string path, int version) =>
+        ExecuteRaw(path, $"PRAGMA user_version = {version}");
 
     [Fact]
     public void ReopeningReadsBackWhatWasStored()

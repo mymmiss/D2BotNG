@@ -6,7 +6,12 @@
  * IN the tabs is the caller's, because that is where the two schemas actually differ.
  */
 
-import { useEffect, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useState,
+  type ComponentPropsWithoutRef,
+  type ReactNode,
+} from "react";
 import { TabGroup, TabList, Tab, TabPanels, TabPanel } from "@headlessui/react";
 import clsx from "clsx";
 import { Card, CardContent } from "@/components/ui";
@@ -89,6 +94,41 @@ export function SegmentedControl({ children }: { children: ReactNode }) {
   );
 }
 
+/**
+ * One option inside a `SegmentedControl`. Owns the selected/unselected/disabled look, which is
+ * the part that must not drift between the pickers; a caller adds only sizing and content.
+ */
+export function SegmentedButton({
+  selected,
+  disabled = false,
+  className,
+  children,
+  ...rest
+}: {
+  selected: boolean;
+  className?: string;
+  children: ReactNode;
+} & Omit<ComponentPropsWithoutRef<"button">, "className" | "children">) {
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      className={clsx(
+        "relative rounded font-medium",
+        disabled
+          ? "cursor-not-allowed text-zinc-600"
+          : selected
+            ? "bg-zinc-700 text-zinc-100"
+            : "text-zinc-400 hover:text-zinc-200",
+        className,
+      )}
+      {...rest}
+    >
+      {children}
+    </button>
+  );
+}
+
 /** Marks the option that is live right now, as opposed to the one being looked at. */
 export function ActiveDot() {
   return (
@@ -120,9 +160,9 @@ export function DifficultySelector({
       {DIFFICULTY_NAMES.map((name, id) => {
         const enabled = id === activeDifficulty || hasData(id);
         return (
-          <button
+          <SegmentedButton
             key={id}
-            type="button"
+            selected={selected === id}
             disabled={!enabled}
             onClick={() => onSelect(id)}
             title={
@@ -132,18 +172,11 @@ export function DifficultySelector({
                   ? undefined
                   : "No data"
             }
-            className={clsx(
-              "relative rounded px-3 py-1 font-medium",
-              !enabled
-                ? "cursor-not-allowed text-zinc-600"
-                : selected === id
-                  ? "bg-zinc-700 text-zinc-100"
-                  : "text-zinc-400 hover:text-zinc-200",
-            )}
+            className="px-3 py-1"
           >
             {name}
             {id === activeDifficulty && <ActiveDot />}
-          </button>
+          </SegmentedButton>
         );
       })}
     </SegmentedControl>

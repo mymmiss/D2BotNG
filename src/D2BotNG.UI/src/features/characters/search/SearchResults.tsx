@@ -16,7 +16,7 @@
 import { memo, useCallback, useEffect, useMemo } from "react";
 import type { TooltipEngine } from "d2itemtoolkit";
 import type { ItemColumn, ItemMatch } from "@/generated/captures_pb";
-import { Owner } from "@/generated/captures_pb";
+import { Owner, StashTabKind } from "@/generated/captures_pb";
 import { ItemSprite } from "@/lib/rendering";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useHeldKey } from "@/hooks/useHeldKey";
@@ -35,7 +35,7 @@ import {
   trimBlankRows,
   type RenderedLine,
 } from "../viewer/capturedItem";
-import { CONTAINER_LABELS } from "../viewer/contracts";
+import { CONTAINER_LABELS, stashPageLabel } from "../viewer/contracts";
 import {
   DAMAGE_COLUMN_BY_KIND,
   SORTABLE_SECTIONS,
@@ -71,10 +71,17 @@ function withoutSetBlock(lines: RenderedLine[]): RenderedLine[] {
 }
 
 function locationOf(match: ItemMatch): string {
-  const container = CONTAINER_LABELS[match.container] ?? match.container;
-  const page = match.container === "stash" ? ` ${match.page + 1}` : "";
+  // A stash page is named the way the viewer's tab strip names it, so the two agree.
+  const container =
+    match.container === "stash"
+      ? stashPageLabel({
+          kind: match.stashKind === StashTabKind.SHARED ? "shared" : "personal",
+          index: match.page,
+          name: match.stashName,
+        })
+      : (CONTAINER_LABELS[match.container] ?? match.container);
   const owner = match.owner === Owner.MERC ? " · Mercenary" : "";
-  return `${container}${page}${owner}`;
+  return `${container}${owner}`;
 }
 
 /**
@@ -410,7 +417,7 @@ export function SearchResults({
           return (
             <div
               // gid is unique only within one game, so it takes the profile and slot to be a key.
-              key={`${match.profile}-${match.container}-${match.page}-${item.gid}-${item.x}-${item.y}`}
+              key={`${match.profile}-${match.owner}-${match.container}-${match.stashKind}-${match.page}-${item.gid}-${item.x}-${item.y}`}
               data-index={virtual.index}
               ref={virtualizer.measureElement}
               style={{

@@ -108,22 +108,92 @@ export const CONTAINER_LABELS: Record<string, string> = {
   stash: "Stash",
 };
 
-/** The storage grids the viewer lays out, in the order it lays them out; stash pages follow. */
+/** The storage grids the viewer lays out, in the order it lays them out; the stash follows. */
 export const STORAGE_IDS = ["inventory", "cube", "belt"] as const;
 
 /**
- * What to call one stash page.
+ * Which stash a page belongs to. A page's index is 0-based WITHIN its kind, so the pair is the
+ * page's identity: the first personal and the first shared page are both page 0.
  *
- * A lone page is just "Stash" — numbering it would imply there are others. Where there are
- * several it is the page's own name if the game gave it one, and its 1-based index if not.
+ * v2 states it outright; v1 never had more than the personal stash, so its pages are all
+ * personal. An OLDER v2 producer sent no kind either — and proto3 reads that as the zero value,
+ * which is personal, which is the only kind such an engine could report. No detection needed.
+ */
+export type StashKind = "personal" | "shared";
+
+/** What a page is for. Always "normal" on LoD; D2R adds stackable-only and Chronicle tabs. */
+export type StashPageType = "normal" | "advanced" | "chronicle";
+
+/** One stash page, as the viewer draws it: its identity, its gold, and its grid. */
+export interface DisplayStashPage {
+  kind: StashKind;
+  /** 0-based within its kind. */
+  index: number;
+  /** The tab's own name; empty when unnamed. */
+  name: string;
+  type: StashPageType;
+  /** Gold held on this page; 0 when none, or when the producer reports no per-page figure. */
+  gold: number;
+  container: DisplayContainer;
+}
+
+export const STASH_KIND_LABELS: Record<StashKind, string> = {
+  personal: "Personal",
+  shared: "Shared",
+};
+
+/** A qualifier for the page types that are not the plain one; the plain one needs no word. */
+export const STASH_PAGE_TYPE_LABELS: Record<StashPageType, string | undefined> =
+  {
+    normal: undefined,
+    advanced: "Stackables only",
+    chronicle: "Chronicle",
+  };
+
+/** The stat ids both stacks report under: level, and gold carried and in the stash. */
+export const STAT_LEVEL = 12;
+export const STAT_GOLD = 14;
+export const STAT_STASH_GOLD = 15;
+
+/** A stat off a wearer as a number; 0 when unreported. Both stacks send the same `{id, value}`. */
+export function statOf(stats: StatValue[] | undefined, id: number): number {
+  return Number(stats?.find((s) => s.id === id)?.value ?? 0n);
+}
+
+/**
+ * What to call one stash page, wherever a page is named: a tab in the viewer or a search
+ * result's provenance. The page's own name if the game gave it one, else its kind and 1-based
+ * index ("Personal 2", "Shared 1") — the index alone is ambiguous across kinds.
  */
 export function stashPageLabel(
-  name: string,
-  index: number,
-  pageCount: number,
+  page: Pick<DisplayStashPage, "kind" | "index" | "name">,
 ): string {
-  if (pageCount <= 1) return CONTAINER_LABELS.stash;
-  return name || `${CONTAINER_LABELS.stash} ${index + 1}`;
+  return page.name || `${STASH_KIND_LABELS[page.kind]} ${page.index + 1}`;
+}
+
+/**
+ * Gives the stash-gold stat to the first personal page when no page reports gold of its own.
+ *
+ * A producer that knows about per-page gold sends the figure on the page (on LoD, the first
+ * personal tab carries the whole stash's, and every other tab 0). One that does not — v1, and v2
+ * engines from before stash kinds — sends nothing, and the same number is still on the wearer as
+ * stat 15. So a page that reports gold is believed, and only when none does is the stat used;
+ * the two never disagree on LoD, and a newer producer's zeros are left alone rather than
+ * overwritten with a stat that is the same zero.
+ */
+export function withStashGoldFallback(
+  pages: DisplayStashPage[],
+  bankGold: number,
+): DisplayStashPage[] {
+  // Gated on the PERSONAL pages only: stat 15 is the personal stash's gold, so a shared page
+  // reporting gold says nothing about whether the personal figure was attributed.
+  const personalReported = pages.some(
+    (p) => p.kind === "personal" && p.gold > 0,
+  );
+  if (bankGold <= 0 || personalReported) return pages;
+  const first = pages.findIndex((p) => p.kind === "personal");
+  if (first < 0) return pages;
+  return pages.map((p, i) => (i === first ? { ...p, gold: bankGold } : p));
 }
 
 /**

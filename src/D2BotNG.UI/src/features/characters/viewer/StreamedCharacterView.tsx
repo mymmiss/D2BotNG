@@ -19,11 +19,15 @@ import { ProgressionPanel } from "./ProgressionPanel";
 import { AnalyticsPanel } from "./AnalyticsPanel";
 import {
   CONTAINER_LABELS,
+  STAT_GOLD,
+  STAT_STASH_GOLD,
   STORAGE_IDS,
-  stashPageLabel,
+  statOf,
+  withStashGoldFallback,
   type AreaDuration,
   type CharacterFacts,
   type DifficultyProgress,
+  type DisplayStashPage,
   type KillCount,
   type SkillLevels,
 } from "./contracts";
@@ -89,23 +93,37 @@ export function StreamedCharacterView({
 
   const storage = useMemo(() => {
     const containers = character.containers;
-    const stashPages = containers
-      .filter((c) => c.id === "stash")
-      .sort((a, b) => a.page - b.page);
     const out: LabeledContainer[] = [];
     for (const id of STORAGE_IDS) {
       const container = containerById(containers, id);
       if (container) out.push({ label: CONTAINER_LABELS[id], container });
     }
-    for (const page of stashPages) {
-      out.push({
-        label: stashPageLabel(page.name, page.page, stashPages.length),
-        // The id is a React key and every page shares "stash", so page-qualify it.
-        container: { ...page, id: `stash-${page.page}` },
-      });
-    }
     return out;
   }, [character.containers]);
+
+  // v1 only ever knew the personal stash, so every page is a personal, plain one, and it carries
+  // no per-page gold: the stash-gold stat is the whole figure, given to the first page.
+  const stash = useMemo(
+    () =>
+      withStashGoldFallback(
+        character.containers
+          .filter((c) => c.id === "stash")
+          .sort((a, b) => a.page - b.page)
+          .map(
+            (page): DisplayStashPage => ({
+              kind: "personal",
+              index: page.page,
+              name: page.name,
+              type: "normal",
+              gold: 0,
+              // The id is a React key and every page shares "stash", so page-qualify it.
+              container: { ...page, id: `stash-personal-${page.page}` },
+            }),
+          ),
+        statOf(character.stats, STAT_STASH_GOLD),
+      ),
+    [character.containers, character.stats],
+  );
 
   const skills = useMemo<SkillLevels[]>(
     () =>
@@ -178,9 +196,11 @@ export function StreamedCharacterView({
           profileKey={character.profile}
           expansion={facts.expansion}
           activeSet={facts.hand}
+          gold={statOf(character.stats, STAT_GOLD)}
           equipped={equipped}
           merc={merc}
           storage={storage}
+          stash={stash}
         />
       }
       statsAndSkills={

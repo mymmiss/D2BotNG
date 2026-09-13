@@ -11,8 +11,11 @@
  * marked); the selection is the user's and stays put as the active set flips live.
  */
 
-import clsx from "clsx";
-import { ActiveDot, SegmentedControl } from "./CharacterChrome";
+import {
+  ActiveDot,
+  SegmentedButton,
+  SegmentedControl,
+} from "./CharacterChrome";
 import { ItemCell } from "./ItemCell";
 import type { DisplayContainer, DisplayItem } from "./contracts";
 
@@ -113,25 +116,20 @@ export function WeaponSetToggle({
   return (
     <SegmentedControl>
       {([0, 1] as const).map((set) => (
-        <button
+        <SegmentedButton
           key={set}
-          type="button"
+          selected={selectedSet === set}
           onClick={() => onSelect(set)}
           title={
             set === activeSet
               ? "Active weapon set"
               : `Weapon set ${set === 0 ? "I" : "II"}`
           }
-          className={clsx(
-            "relative rounded px-2 py-0.5 font-medium",
-            selectedSet === set
-              ? "bg-zinc-700 text-zinc-100"
-              : "text-zinc-400 hover:text-zinc-200",
-          )}
+          className="px-2 py-0.5"
         >
           {set === 0 ? "I" : "II"}
           {set === activeSet && <ActiveDot />}
-        </button>
+        </SegmentedButton>
       ))}
     </SegmentedControl>
   );

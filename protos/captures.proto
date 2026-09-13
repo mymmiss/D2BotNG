@@ -199,21 +199,47 @@ message Container {
 // A multi-page store. Structurally NOT a Container — it holds no items and has no grid of its
 // own; those belong to its pages.
 //
-// One limitation, since storage keys a stash row BY page: a stash with zero pages cannot round
-// trip. It stores no rows, and a read then finds none and leaves this field unset — which the
+// One limitation, since storage keys a stash row by (kind, page): a stash with zero pages cannot
+// round trip. It stores no rows, and a read then finds none and leaves this field unset — which the
 // contract defines as "unchanged". The producer always sends at least the personal tab, so this
 // is unreachable rather than merely unlikely.
 message Stash {
   repeated StashPage pages = 1;
 }
 
-// One page of a multi-page store. `index` and `name` are the producer's own keys.
+// Which stash a page belongs to. Vanilla LoD has one personal tab; PlugY and D2R add more,
+// including account-wide shared ones. `index` is 0-based WITHIN a kind, so (kind, index) is a
+// page's identity and the kind is part of the storage key, not decoration.
+enum StashTabKind {
+  STASH_TAB_KIND_PERSONAL = 0;
+  STASH_TAB_KIND_SHARED = 1;
+}
+
+// What a page is for. Always NORMAL on LoD; D2R has stackable-only and Chronicle tabs.
+enum StashTabType {
+  STASH_TAB_TYPE_NORMAL = 0;
+  STASH_TAB_TYPE_ADVANCED_STASH = 1;
+  STASH_TAB_TYPE_CHRONICLE = 2;
+}
+
+// One page of a multi-page store. `kind`, `index` and `name` are the producer's own keys.
+//
+// `kind`, `type` and `gold` are fields an OLDER producer never sent, and proto3 reads an absent
+// field as zero: a page from such an engine is therefore a personal, normal page carrying no
+// gold — which is exactly what such an engine had, since it only ever reported the single
+// vanilla tab. That is the whole of the backwards compatibility: nothing is versioned or
+// defaulted by hand, the zero values ARE the old meaning.
 message StashPage {
-  int32 index = 1;
-  string name = 2;   // display name, e.g. "Personal"
-  int32 width = 3;
-  int32 height = 4;
-  repeated Unit items = 5;
+  StashTabKind kind = 1;
+  int32 index = 2;
+  StashTabType type = 3;
+  string name = 4;   // the tab's own name; empty when unnamed (an old producer sent "Personal")
+  // Gold held on this tab. Where a game keeps one figure per stash rather than per tab (LoD),
+  // the producer attributes it to the first tab of its kind and every other tab reports 0.
+  uint32 gold = 5;
+  int32 width = 6;
+  int32 height = 7;
+  repeated Unit items = 8;
 }
 
 // ---------------------------------------------------------------------------
@@ -745,7 +771,9 @@ message SearchItemsResponse {
 message ItemMatch {
   string profile = 1;
   Owner owner = 2;
-  string container = 3;  // container name the item sits in
-  int32 page = 4;        // stash page, 0 otherwise
-  Unit item = 5;         // the whole captured item, socket fillers nested
+  string container = 3;         // container name the item sits in
+  StashTabKind stash_kind = 4;  // which stash, when `container` is "stash"; PERSONAL otherwise
+  string stash_name = 5;        // the page's own name when `container` is "stash"; "" when unnamed
+  int32 page = 6;               // stash page (0-based within its kind), 0 otherwise
+  Unit item = 7;                // the whole captured item, socket fillers nested
 }

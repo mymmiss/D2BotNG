@@ -160,11 +160,12 @@ internal sealed class SearchQueryBuilder
     /// Where a row sits, which is also the natural reading order: by character, then container,
     /// then position on the grid.
     ///
-    /// This is the tail of EVERY ordering, not just the default. owner/page/id are not decoration:
-    /// container names repeat across the player and the merc and across stash pages, so without a
+    /// This is the tail of EVERY ordering, not just the default. owner/stash_kind/page/id are not
+    /// decoration: container names repeat across the player and the merc and across stash pages
+    /// (and a page index repeats across the two stash kinds), so without a
     /// unique final key OFFSET paging can repeat a row on one page and skip it on the next.
     /// </summary>
-    private const string DefaultOrder = "i.profile, c.name, c.owner, c.page, i.y, i.x, i.id";
+    private const string DefaultOrder = "i.profile, c.name, c.owner, c.stash_kind, c.page, i.y, i.x, i.id";
 
     /// <summary>
     /// Builds the ORDER BY, and for a stat key the CTE and LEFT JOIN that feed it.

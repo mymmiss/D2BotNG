@@ -12,6 +12,15 @@ import type { DisplayContainer } from "./contracts";
 const CELL = 29;
 
 /**
+ * The grid's surface: the wash behind the cells and the edge around them. Exported so the
+ * readouts drawn beside a grid (the gold box) take the same paint from the same place.
+ */
+export const GRID_SURFACE_STYLE = {
+  backgroundColor: "rgba(0, 0, 0, 0.4)",
+  border: "1px solid rgba(255,255,255,0.12)",
+} as const;
+
+/**
  * Memoised on the container, which is the whole grid's worth of work: a page can hold a few hundred
  * items and the viewer re-renders on every capture change from any profile. The container object is
  * rebuilt only when that character's own capture is, so a grid is reconciled when its contents
@@ -31,12 +40,11 @@ export const ContainerGrid = memo(function ContainerGrid({
         position: "relative",
         width: cols * CELL + 1,
         height: rows * CELL + 1,
-        backgroundColor: "rgba(0, 0, 0, 0.4)",
+        ...GRID_SURFACE_STYLE,
         backgroundImage:
           "linear-gradient(to right, rgba(255,255,255,0.08) 1px, transparent 1px)," +
           "linear-gradient(to bottom, rgba(255,255,255,0.08) 1px, transparent 1px)",
         backgroundSize: `${CELL}px ${CELL}px`,
-        border: "1px solid rgba(255,255,255,0.12)",
       }}
     >
       {container.items.map((item, i) => {

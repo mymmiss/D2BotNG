@@ -1,3 +1,4 @@
+using System.Data;
 using Microsoft.Data.Sqlite;
 
 namespace D2BotNG.Capture;
@@ -10,24 +11,34 @@ namespace D2BotNG.Capture;
 /// deserialized documents. Everything else — identity, skills, progression, kills, area time —
 /// is stored relationally too, but only because it is cheap to; nothing queries across it yet.
 ///
-/// The database is derived state, not a system of record. It holds what running bots reported,
-/// and a bot re-reports its whole character on the next game it enters, so a corrupt or deleted
-/// file costs the history of stopped profiles and nothing else. That is why the recovery path
-/// for a schema too new to read is to delete and recreate rather than to fail startup.
+/// The database is mostly derived state, not a system of record. It holds what running bots
+/// reported, and a bot re-reports its whole character on the next game it enters, so a corrupt
+/// or deleted file costs the history of stopped profiles and nothing else. That is why the
+/// recovery path for a schema too new to read, or a file that cannot be read at all, is to delete
+/// and recreate rather than to fail startup. The exception is what a bot does NOT re-report: the
+/// lifetime kill and area-time totals only ever accumulate here, and they are why an OLDER file
+/// is migrated forward rather than discarded.
 /// </summary>
 internal static class CaptureSchema
 {
     /// <summary>
-    /// Bumped whenever <see cref="Ddl" /> changes shape. A file at any OTHER version — older or
-    /// newer — is deleted and recreated rather than migrated, because nothing has shipped and so
-    /// there is no file in the world to preserve. Migrating only backwards-versioned files would
-    /// also contradict this store's own policy: a file it cannot read is discarded precisely
-    /// because captures are derived state, and that is no less true of an old one than a new one.
+    /// Bumped whenever <see cref="Ddl" /> changes shape, with a step added to
+    /// <see cref="Migrations" /> that takes a file from the previous version to this one.
     ///
-    /// A migration chain earns its place the day a bump would cost the accumulated kill and
-    /// area-time totals — the only things a bot does not re-report on its next game.
+    /// Older files are upgraded in place, one step at a time, inside one transaction, after a
+    /// one-time copy of the original is set aside (see <see cref="BackUp" />). A step that fails
+    /// rolls the whole upgrade back — never a half-converted database — and the caller then
+    /// recreates the file, which is why the copy exists: a failed step would otherwise discard
+    /// the accumulated totals the upgrade was written to keep. NEWER files are recreated
+    /// outright: this build cannot know their shape, and captures are re-reported within minutes.
+    ///
+    /// History:
+    ///   1  initial shape
+    ///   2  stash pages carry their kind (personal / shared), type and gold; (kind, page)
+    ///      replaces page alone in the container key, since PlugY and D2R number pages within
+    ///      a kind and personal 0 and shared 0 are different pages
     /// </summary>
-    public const int Version = 1;
+    public const int Version = 2;
 
     /// <summary>
     /// Owner discriminator on containers, stats and skills. Matches the Owner proto enum.
@@ -49,7 +60,68 @@ internal static class CaptureSchema
     public const string ContainerBelt = "belt";
     public const string ContainerStash = "stash";
 
-    private const string Ddl = """
+    /// <summary>
+    /// The container table, as a function of its name because the 1→2 migration has to build the
+    /// new shape BESIDE the old one (SQLite cannot alter a table-level UNIQUE in place) and it
+    /// must be the same shape a fresh file gets — stating it once is what guarantees that.
+    /// </summary>
+    private static string ContainerTable(string table) =>
+        $"""
+        -- A grid (inventory/stash page/cube/belt) or slot set (equipped). Replaced wholesale
+        -- whenever the engine re-sends it, which it does only when its contents changed.
+        --
+        -- stash_kind, stash_type and gold mean something only on a stash page; the others carry
+        -- the zero defaults. The kind is part of the key because a page's index is 0-based within
+        -- its kind: the first personal and the first shared page are both page 0.
+        CREATE TABLE {table} (
+            id          INTEGER PRIMARY KEY,
+            profile     TEXT    NOT NULL REFERENCES character(profile) ON DELETE CASCADE,
+            owner       INTEGER NOT NULL,
+            name        TEXT    NOT NULL,  -- equipped | inventory | cube | belt | stash
+            label       TEXT    NOT NULL DEFAULT '',
+            stash_kind  INTEGER NOT NULL DEFAULT 0,  -- StashTabKind: 0 personal, 1 shared
+            stash_type  INTEGER NOT NULL DEFAULT 0,  -- StashTabType: 0 normal, 1 advanced, 2 chronicle
+            page        INTEGER NOT NULL DEFAULT 0,
+            gold        INTEGER NOT NULL DEFAULT 0,
+            width       INTEGER NOT NULL DEFAULT 0,
+            height      INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (profile, owner, name, stash_kind, page)
+        ) STRICT;
+        """;
+
+    /// <summary>
+    /// One upgrade step. <paramref name="CheckTables" /> names the child tables whose foreign
+    /// keys the step could have broken — the ones it rebuilt or re-pointed — and ONLY those are
+    /// verified afterwards. A database-wide check would also fail on an orphan row the step never
+    /// went near (a file once opened in a DB browser with foreign keys off, say), and the caller's
+    /// answer to a failed upgrade is to recreate the file: a stray row from years ago must not
+    /// cost the lifetime totals today.
+    /// </summary>
+    private sealed record MigrationStep(string Sql, params string[] CheckTables);
+
+    /// <summary>
+    /// One step per version, keyed by the version it upgrades FROM. Each runs inside the upgrade
+    /// transaction with foreign keys OFF — necessary for any step that rebuilds a table, since
+    /// dropping a referenced table with them on would cascade its rows away.
+    /// </summary>
+    private static readonly IReadOnlyDictionary<int, MigrationStep> Migrations = new Dictionary<int, MigrationStep>
+    {
+        // 1 -> 2: rebuild `container` with the stash columns and the wider key. The generic
+        // ALTER TABLE ... ADD COLUMN would have done for the columns, but not for the UNIQUE
+        // constraint, and a key that cannot hold a shared page 0 next to a personal page 0 is
+        // the thing this version exists to fix. Rows keep their ids, so `item.container_id`
+        // stays valid; the REFERENCES in `item` name the table by its final name, which the
+        // rename restores — which is exactly what the check on `item` confirms.
+        [1] = new(ContainerTable("container_v2") + """
+
+            INSERT INTO container_v2 (id, profile, owner, name, label, page, width, height)
+            SELECT id, profile, owner, name, label, page, width, height FROM container;
+            DROP TABLE container;
+            ALTER TABLE container_v2 RENAME TO container;
+            """, "container", "item"),
+    };
+
+    private static readonly string Ddl = $"""
         -- One row per profile: the player wearer's identity and live position.
         CREATE TABLE character (
             profile          TEXT    PRIMARY KEY,
@@ -134,19 +206,7 @@ internal static class CaptureSchema
             PRIMARY KEY (profile, difficulty, area)
         ) STRICT;
 
-        -- A grid (inventory/stash page/cube/belt) or slot set (equipped). Replaced wholesale
-        -- whenever the engine re-sends it, which it does only when its contents changed.
-        CREATE TABLE container (
-            id       INTEGER PRIMARY KEY,
-            profile  TEXT    NOT NULL REFERENCES character(profile) ON DELETE CASCADE,
-            owner    INTEGER NOT NULL,
-            name     TEXT    NOT NULL,  -- equipped | inventory | cube | belt | stash
-            label    TEXT    NOT NULL DEFAULT '',
-            page     INTEGER NOT NULL DEFAULT 0,
-            width    INTEGER NOT NULL DEFAULT 0,
-            height   INTEGER NOT NULL DEFAULT 0,
-            UNIQUE (profile, owner, name, page)
-        ) STRICT;
+        {ContainerTable("container")}
 
         -- One row per captured unit: a stored item, or a socket filler inside one.
         --
@@ -364,12 +424,17 @@ internal static class CaptureSchema
         """;
 
     /// <summary>
-    /// Creates the schema in a new file, and reports whether an existing one is usable. A file at
-    /// any other version is discarded rather than read: the caller recreates it, which is safe
-    /// precisely because this store is derived state.
+    /// Creates the schema in a new file, upgrades an older one in place, and reports whether the
+    /// result is usable. A file from a NEWER build is the one case that is discarded rather than
+    /// read: the caller recreates it, which is safe because captures are re-reported.
     /// </summary>
-    /// <returns>False when the file is at another version and must be recreated.</returns>
-    public static bool TryUpgrade(SqliteConnection connection)
+    /// <returns>False when the file is at a newer version and must be recreated.</returns>
+    /// <exception cref="Exception">
+    /// A migration step failed, or left a foreign key dangling. The transaction is rolled back
+    /// first, so the file is exactly what it was; the caller treats this like any unreadable file
+    /// — which is why an older file is backed up before anything is transformed.
+    /// </exception>
+    public static bool TryUpgrade(SqliteConnection connection, ILogger? logger = null)
     {
         Execute(connection, "PRAGMA foreign_keys = ON");
         // WAL is for commit latency, NOT reader/writer concurrency — one connection behind one
@@ -390,19 +455,130 @@ internal static class CaptureSchema
 
         var current = QueryUserVersion(connection);
         if (current == Version) return true;
-        if (current != 0) return false;
+        if (current > Version) return false;
 
-        using var transaction = connection.BeginTransaction();
-        Execute(connection, Ddl, transaction);
-        Execute(connection, $"PRAGMA user_version = {Version}", transaction);
-        transaction.Commit();
+        if (current == 0)
+        {
+            using var transaction = connection.BeginTransaction();
+            Execute(connection, Ddl, transaction);
+            Execute(connection, $"PRAGMA user_version = {Version}", transaction);
+            transaction.Commit();
+            return true;
+        }
+
+        BackUp(connection, current, logger);
+        Migrate(connection);
         return true;
     }
 
-    private static int QueryUserVersion(SqliteConnection connection)
+    /// <summary>
+    /// Copies the file to <c>&lt;name&gt;.v&lt;n&gt;.bak</c> before the first transformation — the same
+    /// policy as <c>FileRepository</c>: written once, never overwritten (the migration re-runs
+    /// after a failure), never read back, never auto-deleted. It exists because a failed upgrade
+    /// sends the caller down the recreate path, which discards exactly the accumulated totals the
+    /// upgrade was written to keep.
+    ///
+    /// <c>VACUUM INTO</c> rather than a file copy: the database is open in WAL mode, so a copy of
+    /// the main file alone would miss whatever is still in the log, while VACUUM INTO writes one
+    /// consistent snapshot. It refuses to overwrite, which is the write-once rule for free.
+    ///
+    /// A backup that cannot be written does NOT stop the upgrade. Going ahead without one is what
+    /// every earlier version did; refusing would lose the file for certain to guard against
+    /// losing it possibly.
+    /// </summary>
+    private static void BackUp(SqliteConnection connection, int from, ILogger? logger)
+    {
+        var backup = Path.ChangeExtension(connection.DataSource, $".v{from}.bak");
+        if (File.Exists(backup)) return;
+
+        try
+        {
+            Execute(connection, $"VACUUM INTO '{backup.Replace("'", "''")}'");
+            logger?.LogInformation("Backed up captures at schema version {Version} to {Path} before upgrading",
+                from, backup);
+        }
+        catch (Exception ex)
+        {
+            logger?.LogWarning(ex, "Could not back up captures to {Path} before upgrading; continuing without",
+                backup);
+            // A copy that failed part-way (disk full) is still a file, and the existence check
+            // above would take it for a finished one on every later start. Remove it so the next
+            // attempt writes a whole copy or nothing.
+            try
+            {
+                File.Delete(backup);
+            }
+            catch (Exception deleteEx)
+            {
+                logger?.LogWarning(deleteEx, "Could not remove the partial backup {Path}", backup);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Runs every step from the file's version up to <see cref="Version" /> in one transaction,
+    /// so the file is either fully upgraded or untouched.
+    ///
+    /// Foreign keys are switched off around it, not inside it: the pragma is a no-op within a
+    /// transaction. Off is required rather than merely convenient — a step that drops and
+    /// rebuilds a referenced table would otherwise cascade-delete every row that referenced it,
+    /// which for `container` is every item in the database. The check at the end is what makes
+    /// that safe to have done: a step that left a reference dangling fails the upgrade here,
+    /// before the commit, rather than surfacing as a constraint error on some later write.
+    /// </summary>
+    private static void Migrate(SqliteConnection connection)
+    {
+        Execute(connection, "PRAGMA foreign_keys = OFF");
+        try
+        {
+            // BEGIN IMMEDIATE: the write lock is taken here, not at the first write, so the
+            // version is re-read under it. Two processes on one directory would otherwise both
+            // read 1, and the second to run would re-apply the step to an already-upgraded table
+            // — which for 1→2 succeeds, quietly zeroing the columns the first had filled.
+            using var transaction = connection.BeginTransaction(IsolationLevel.Serializable);
+            var from = QueryUserVersion(connection, transaction);
+            if (from >= Version) return;
+
+            var checkTables = new SortedSet<string>(StringComparer.Ordinal);
+            for (var version = from; version < Version; version++)
+            {
+                if (!Migrations.TryGetValue(version, out var step))
+                    throw new InvalidOperationException($"No captures migration from schema version {version}");
+
+                Execute(connection, step.Sql, transaction);
+                checkTables.UnionWith(step.CheckTables);
+            }
+
+            foreach (var table in checkTables)
+            {
+                using var check = connection.CreateCommand();
+                // The table name is one of this class's own literals, never input.
+                check.CommandText = $"PRAGMA foreign_key_check({table})";
+                check.Transaction = transaction;
+                using var reader = check.ExecuteReader();
+                if (reader.Read())
+                {
+                    // Column 1 is the child's rowid, NULL for a WITHOUT ROWID table.
+                    var row = reader.IsDBNull(1) ? "?" : reader.GetInt64(1).ToString();
+                    throw new InvalidOperationException(
+                        $"Captures migration left a dangling reference in {table} (row {row})");
+                }
+            }
+
+            Execute(connection, $"PRAGMA user_version = {Version}", transaction);
+            transaction.Commit();
+        }
+        finally
+        {
+            Execute(connection, "PRAGMA foreign_keys = ON");
+        }
+    }
+
+    private static int QueryUserVersion(SqliteConnection connection, SqliteTransaction? transaction = null)
     {
         using var command = connection.CreateCommand();
         command.CommandText = "PRAGMA user_version";
+        command.Transaction = transaction;
         return Convert.ToInt32(command.ExecuteScalar() ?? 0);
     }
 

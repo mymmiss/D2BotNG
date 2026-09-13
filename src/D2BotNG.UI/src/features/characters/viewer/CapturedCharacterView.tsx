@@ -10,7 +10,11 @@
 
 import { useMemo, type ReactNode } from "react";
 import type { TooltipEngine } from "d2itemtoolkit";
-import type { Character as CapturedCharacter } from "@/generated/captures_pb";
+import {
+  StashTabKind,
+  StashTabType,
+  type Character as CapturedCharacter,
+} from "@/generated/captures_pb";
 import {
   useResetCapturedAreaTime,
   useResetCapturedKills,
@@ -24,22 +28,39 @@ import { AnalyticsPanel } from "./AnalyticsPanel";
 import { toDisplayContainer, toDisplayItem } from "./capturedItem";
 import {
   CONTAINER_LABELS,
+  STAT_GOLD,
+  STAT_LEVEL,
+  STAT_STASH_GOLD,
   STORAGE_IDS,
-  stashPageLabel,
+  statOf,
+  withStashGoldFallback,
   type CharacterFacts,
   type DifficultyProgress,
+  type DisplayStashPage,
   type SkillLevels,
+  type StashPageType,
 } from "./contracts";
 
 /** .d2s status byte bits, on `Identity.char_flags`. */
 const HARDCORE_FLAG = 0x04;
 const EXPANSION_FLAG = 0x20;
-/** ItemStatCost row 12. A capture holds level as a stat because the game does. */
-const STAT_LEVEL = 12;
 
 /** What the grids are until the tables arrive. Hoisted so it is one reference: `InventoryTab` is
  *  memoised, and a fresh literal here would defeat that for as long as the engine is loading. */
 const NO_STORAGE: LabeledContainer[] = [];
+const NO_STASH: DisplayStashPage[] = [];
+
+/** The wire enum to the viewer's word. An unknown value (a newer producer) reads as plain. */
+function stashPageType(type: StashTabType): StashPageType {
+  switch (type) {
+    case StashTabType.ADVANCED_STASH:
+      return "advanced";
+    case StashTabType.CHRONICLE:
+      return "chronicle";
+    default:
+      return "normal";
+  }
+}
 
 export function CapturedCharacterView({
   captured,
@@ -66,7 +87,7 @@ export function CapturedCharacterView({
     realm: identity?.realm ?? "",
     // Level is stat 12, not a field — a capture stores what the game held, and the game holds
     // level as a stat. There is no derived copy to read.
-    level: Number(player?.stats.find((s) => s.id === STAT_LEVEL)?.value ?? 0n),
+    level: statOf(player?.stats, STAT_LEVEL),
     charClass: player?.classId ?? 0,
     difficulty: identity?.difficulty ?? 0,
     area: player?.area ?? 0,
@@ -89,24 +110,33 @@ export function CapturedCharacterView({
       if (display)
         storage.push({ label: CONTAINER_LABELS[id], container: display });
     }
+    // Personal pages before shared, each kind in page order — the order the game lists them.
     const pages = [...(containers?.stash?.pages ?? [])].sort(
-      (a, b) => a.index - b.index,
+      (a, b) => a.kind - b.kind || a.index - b.index,
     );
-    for (const page of pages) {
-      storage.push({
-        label: stashPageLabel(page.name, page.index, pages.length),
-        container: {
-          // A React key, and every page is a "stash", so it is page-qualified.
-          id: `stash-${page.index}`,
-          width: page.width,
-          height: page.height,
-          items: page.items.map((i) =>
-            toDisplayItem(i, engine, { wearer: player }),
-          ),
-        },
-      });
-    }
+    const stash = withStashGoldFallback(
+      pages.map(
+        (page): DisplayStashPage => ({
+          kind: page.kind === StashTabKind.SHARED ? "shared" : "personal",
+          index: page.index,
+          name: page.name,
+          type: stashPageType(page.type),
+          gold: page.gold,
+          container: {
+            // A React key: every page is a "stash", and an index repeats across kinds.
+            id: `stash-${page.kind}-${page.index}`,
+            width: page.width,
+            height: page.height,
+            items: page.items.map((i) =>
+              toDisplayItem(i, engine, { wearer: player }),
+            ),
+          },
+        }),
+      ),
+      statOf(player.stats, STAT_STASH_GOLD),
+    );
     return {
+      stash,
       equipped: toDisplayContainer("equipped", containers?.equipped, engine, {
         wearer: player,
       }),
@@ -160,9 +190,11 @@ export function CapturedCharacterView({
             profileKey={captured.profile}
             expansion={facts.expansion}
             activeSet={facts.hand}
+            gold={statOf(player?.stats, STAT_GOLD)}
             equipped={gear?.equipped}
             merc={gear?.merc}
             storage={gear?.storage ?? NO_STORAGE}
+            stash={gear?.stash ?? NO_STASH}
           />
         }
         statsAndSkills={
