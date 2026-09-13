@@ -1,3 +1,4 @@
+using D2BotNG.Capture;
 using D2BotNG.Core.Protos;
 using D2BotNG.Data;
 using D2BotNG.Engine;
@@ -12,13 +13,16 @@ public class ProfileServiceImpl : ProfileService.ProfileServiceBase
 {
     private readonly ProfileRepository _profileRepository;
     private readonly ProfileEngine _profileEngine;
+    private readonly CaptureEngine _captureEngine;
 
     public ProfileServiceImpl(
         ProfileRepository profileRepository,
-        ProfileEngine profileEngine)
+        ProfileEngine profileEngine,
+        CaptureEngine captureEngine)
     {
         _profileRepository = profileRepository;
         _profileEngine = profileEngine;
+        _captureEngine = captureEngine;
     }
 
     public override async Task<Empty> Create(Profile request, ServerCallContext context)
@@ -57,6 +61,8 @@ public class ProfileServiceImpl : ProfileService.ProfileServiceBase
             await _profileRepository.DeleteAsync(request.OriginalName);
             await _profileRepository.CreateAsync(profile);
             _profileEngine.RenameProfile(request.OriginalName, profile.Name);
+            // Captures are keyed by profile too; a delete, by contrast, leaves them in place.
+            _captureEngine.RenameProfile(request.OriginalName, profile.Name);
             // Rename changes the profile set — need full snapshot
             await _profileEngine.BroadcastProfilesSnapshotAsync();
         }

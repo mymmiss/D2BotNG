@@ -61,7 +61,7 @@ internal sealed class SearchQueryBuilder
     {
         Validate(request, tooltip);
 
-        AppendIn("i.profile", request.Profiles);
+        AppendCharacters(request);
 
         AppendIdentity(request);
 
@@ -165,7 +165,35 @@ internal sealed class SearchQueryBuilder
     /// (and a page index repeats across the two stash kinds), so without a
     /// unique final key OFFSET paging can repeat a row on one page and skip it on the next.
     /// </summary>
-    private const string DefaultOrder = "i.profile, c.name, c.owner, c.stash_kind, c.page, i.y, i.x, i.id";
+    private const string DefaultOrder =
+        "ch.profile, ch.char_name, c.name, c.owner, c.stash_kind, c.page, i.y, i.x, i.id";
+
+    /// <summary>
+    /// Which characters to look in, as one semi-join on the denormalised character id. The two
+    /// grains OR together inside it: a profile names every character captured through it, a key
+    /// names one. Resolved through the character table rather than by carrying the profile onto
+    /// every item, so a profile rename touches one table and a name is compared once.
+    /// </summary>
+    private void AppendCharacters(SearchItemsRequest request)
+    {
+        if (request.Profiles.Count == 0 && request.Characters.Count == 0) return;
+
+        var terms = new List<string>();
+        if (request.Profiles.Count > 0)
+        {
+            var list = string.Join(", ", request.Profiles.Select((p, i) => Param($"pr{i}", p)));
+            terms.Add($"profile IN ({list})");
+        }
+
+        for (var k = 0; k < request.Characters.Count; k++)
+        {
+            var key = request.Characters[k];
+            terms.Add($"(profile = {Param($"kp{k}", key.Profile)} AND char_name = {Param($"kn{k}", key.Name)})");
+        }
+
+        _where.Append(
+            $"\n   AND i.character_id IN (SELECT id FROM character WHERE {string.Join(" OR ", terms)})");
+    }
 
     /// <summary>
     /// Builds the ORDER BY, and for a stat key the CTE and LEFT JOIN that feed it.
@@ -470,6 +498,15 @@ internal sealed class SearchQueryBuilder
         Chain("conditions", request.Conditions.Count);
         Chain("groups", request.Groups.Count);
         Chain("specific_items", request.SpecificItems.Count);
+        Chain("characters", request.Characters.Count);
+
+        // A key with no profile can name nothing, and an empty character name is a legitimate
+        // (if transient) row, so only the profile half is required.
+        for (var k = 0; k < request.Characters.Count; k++)
+        {
+            if (string.IsNullOrEmpty(request.Characters[k].Profile))
+                throw new InvalidSearchRequestException($"characters[{k}] names no profile");
+        }
 
         foreach (var container in request.Containers)
         {

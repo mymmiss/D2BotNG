@@ -95,14 +95,14 @@ message CapturesSnapshot {
   repeated d2bot.captures.CharacterSummary characters = 1;
 }
 
-// One profile's capture changed. Just the name — the client refetches the character if it happens
-// to be showing it, and ignores this otherwise.
+// One capture changed. Just the key — the client refetches the character if it happens to be
+// showing it, and ignores this otherwise.
 //
 // This is what replaces polling. The heavy payload still moves only for the character on screen,
 // but it moves when something actually happened rather than on a timer, so an idle manager is
 // silent and a busy one is current.
 message CaptureChanged {
-  string profile = 1;
+  d2bot.captures.CharacterKey key = 1;
   // The summary too, so the list stays live without a second round trip. A capture always has one
   // — it is derived from the same row — so this is never a partial stand-in for the character.
   d2bot.captures.CharacterSummary summary = 2;

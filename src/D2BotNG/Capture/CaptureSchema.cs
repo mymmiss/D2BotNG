@@ -37,8 +37,12 @@ internal static class CaptureSchema
     ///   2  stash pages carry their kind (personal / shared), type and gold; (kind, page)
     ///      replaces page alone in the container key, since PlugY and D2R number pages within
     ///      a kind and personal 0 and shared 0 are different pages
+    ///   3  a capture is keyed by (profile, character name) rather than by profile: `character`
+    ///      gains a surrogate id and that unique pair, and every table that hung off the profile
+    ///      string hangs off the id instead. One profile playing several characters — a mule
+    ///      profile — used to overwrite each with the next; now each keeps its own capture
     /// </summary>
-    public const int Version = 2;
+    public const int Version = 3;
 
     /// <summary>
     /// Owner discriminator on containers, stats and skills. Matches the Owner proto enum.
@@ -61,9 +65,9 @@ internal static class CaptureSchema
     public const string ContainerStash = "stash";
 
     /// <summary>
-    /// The container table, as a function of its name because the 1→2 migration has to build the
-    /// new shape BESIDE the old one (SQLite cannot alter a table-level UNIQUE in place) and it
-    /// must be the same shape a fresh file gets — stating it once is what guarantees that.
+    /// The container table, as a function of its name because a migration has to build the new
+    /// shape BESIDE the old one (SQLite cannot alter a table-level UNIQUE in place) and it must
+    /// be the same shape a fresh file gets — stating it once is what guarantees that.
     /// </summary>
     private static string ContainerTable(string table) =>
         $"""
@@ -74,18 +78,18 @@ internal static class CaptureSchema
         -- the zero defaults. The kind is part of the key because a page's index is 0-based within
         -- its kind: the first personal and the first shared page are both page 0.
         CREATE TABLE {table} (
-            id          INTEGER PRIMARY KEY,
-            profile     TEXT    NOT NULL REFERENCES character(profile) ON DELETE CASCADE,
-            owner       INTEGER NOT NULL,
-            name        TEXT    NOT NULL,  -- equipped | inventory | cube | belt | stash
-            label       TEXT    NOT NULL DEFAULT '',
-            stash_kind  INTEGER NOT NULL DEFAULT 0,  -- StashTabKind: 0 personal, 1 shared
-            stash_type  INTEGER NOT NULL DEFAULT 0,  -- StashTabType: 0 normal, 1 advanced, 2 chronicle
-            page        INTEGER NOT NULL DEFAULT 0,
-            gold        INTEGER NOT NULL DEFAULT 0,
-            width       INTEGER NOT NULL DEFAULT 0,
-            height      INTEGER NOT NULL DEFAULT 0,
-            UNIQUE (profile, owner, name, stash_kind, page)
+            id            INTEGER PRIMARY KEY,
+            character_id  INTEGER NOT NULL REFERENCES character(id) ON DELETE CASCADE,
+            owner         INTEGER NOT NULL,
+            name          TEXT    NOT NULL,  -- equipped | inventory | cube | belt | stash
+            label         TEXT    NOT NULL DEFAULT '',
+            stash_kind    INTEGER NOT NULL DEFAULT 0,  -- StashTabKind: 0 personal, 1 shared
+            stash_type    INTEGER NOT NULL DEFAULT 0,  -- StashTabType: 0 normal, 1 advanced, 2 chronicle
+            page          INTEGER NOT NULL DEFAULT 0,
+            gold          INTEGER NOT NULL DEFAULT 0,
+            width         INTEGER NOT NULL DEFAULT 0,
+            height        INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (character_id, owner, name, stash_kind, page)
         ) STRICT;
         """;
 
@@ -112,22 +116,128 @@ internal static class CaptureSchema
         // the thing this version exists to fix. Rows keep their ids, so `item.container_id`
         // stays valid; the REFERENCES in `item` name the table by its final name, which the
         // rename restores — which is exactly what the check on `item` confirms.
-        [1] = new(ContainerTable("container_v2") + """
+        [1] = new(ContainerV2Table("container_v2") + """
 
             INSERT INTO container_v2 (id, profile, owner, name, label, page, width, height)
             SELECT id, profile, owner, name, label, page, width, height FROM container;
             DROP TABLE container;
             ALTER TABLE container_v2 RENAME TO container;
             """, "container", "item"),
+
+        // 2 -> 3: a character gets a surrogate id and the (profile, name) key, and every child
+        // table re-keys from the profile string to that id. The old character table's rowid
+        // becomes the id, so the children's rows map through a join on the profile they carry —
+        // which is exact, because at version 2 a profile IS one character.
+        //
+        // `item` is the store's largest table and is rewritten IN PLACE (add the column, fill it,
+        // drop the old one, put the index back) rather than copied; everything else is small and
+        // rebuilt beside itself. The old `character` goes last, since every copy joins it.
+        [2] = new(
+            $"""
+            {CharacterTable("character_v3")}
+            INSERT INTO character_v3 (id, profile, char_name, account, realm, char_class, level, char_flags,
+                                      flags_ex, ladder, difficulty, area, hand, game_id, updated_at, area_entered_at)
+            SELECT rowid, profile, char_name, account, realm, char_class, level, char_flags,
+                   flags_ex, ladder, difficulty, area, hand, game_id, updated_at, area_entered_at
+              FROM character;
+
+            {MercTable("merc_v3")}
+            INSERT INTO merc_v3 (character_id, name, class_id, flags_ex)
+            SELECT c.rowid, t.name, t.class_id, t.flags_ex
+              FROM merc t JOIN character c ON c.profile = t.profile;
+
+            {WearerStatTable("wearer_stat_v3")}
+            INSERT INTO wearer_stat_v3 (character_id, owner, stat_id, value)
+            SELECT c.rowid, t.owner, t.stat_id, t.value
+              FROM wearer_stat t JOIN character c ON c.profile = t.profile;
+
+            {WearerSkillTable("wearer_skill_v3")}
+            INSERT INTO wearer_skill_v3 (character_id, owner, skill_id, hard_points, level)
+            SELECT c.rowid, t.owner, t.skill_id, t.hard_points, t.level
+              FROM wearer_skill t JOIN character c ON c.profile = t.profile;
+
+            {ProgressionTable("progression_v3")}
+            INSERT INTO progression_v3 (character_id, difficulty, kind, entry_id)
+            SELECT c.rowid, t.difficulty, t.kind, t.entry_id
+              FROM progression t JOIN character c ON c.profile = t.profile;
+
+            {KillTable("kill_v3")}
+            INSERT INTO kill_v3 (character_id, difficulty, super_unique, entry_id, spec, count)
+            SELECT c.rowid, t.difficulty, t.super_unique, t.entry_id, t.spec, t.count
+              FROM kill t JOIN character c ON c.profile = t.profile;
+
+            {AreaTimeTable("area_time_v3")}
+            INSERT INTO area_time_v3 (character_id, difficulty, area, milliseconds)
+            SELECT c.rowid, t.difficulty, t.area, t.milliseconds
+              FROM area_time t JOIN character c ON c.profile = t.profile;
+
+            {ContainerTable("container_v3")}
+            INSERT INTO container_v3 (id, character_id, owner, name, label, stash_kind, stash_type, page, gold,
+                                      width, height)
+            SELECT t.id, c.rowid, t.owner, t.name, t.label, t.stash_kind, t.stash_type, t.page, t.gold,
+                   t.width, t.height
+              FROM container t JOIN character c ON c.profile = t.profile;
+
+            DROP INDEX item_by_profile;
+            ALTER TABLE item ADD COLUMN character_id INTEGER NOT NULL DEFAULT 0;
+            UPDATE item SET character_id = (SELECT c.rowid FROM character c WHERE c.profile = item.profile);
+            ALTER TABLE item DROP COLUMN profile;
+            CREATE INDEX item_by_character ON item(character_id);
+
+            DROP TABLE merc;         ALTER TABLE merc_v3 RENAME TO merc;
+            DROP TABLE wearer_stat;  ALTER TABLE wearer_stat_v3 RENAME TO wearer_stat;
+            DROP TABLE wearer_skill; ALTER TABLE wearer_skill_v3 RENAME TO wearer_skill;
+            DROP TABLE progression;  ALTER TABLE progression_v3 RENAME TO progression;
+            DROP TABLE kill;         ALTER TABLE kill_v3 RENAME TO kill;
+            DROP TABLE area_time;    ALTER TABLE area_time_v3 RENAME TO area_time;
+            DROP TABLE container;    ALTER TABLE container_v3 RENAME TO container;
+            DROP TABLE character;    ALTER TABLE character_v3 RENAME TO character;
+            """,
+            "merc", "wearer_stat", "wearer_skill", "progression", "kill", "area_time", "container", "item",
+            "statlist"),
     };
 
-    private static readonly string Ddl = $"""
-        -- One row per profile: the player wearer's identity and live position.
-        CREATE TABLE character (
-            profile          TEXT    PRIMARY KEY,
+    /// <summary>
+    /// The container table as version 2 wrote it, kept for the 1→2 step: a step must build the
+    /// shape of ITS target version, not whatever the current one is, or a file two versions
+    /// behind would skip the middle.
+    /// </summary>
+    private static string ContainerV2Table(string table) =>
+        $"""
+        CREATE TABLE {table} (
+            id          INTEGER PRIMARY KEY,
+            profile     TEXT    NOT NULL REFERENCES character(profile) ON DELETE CASCADE,
+            owner       INTEGER NOT NULL,
+            name        TEXT    NOT NULL,
+            label       TEXT    NOT NULL DEFAULT '',
+            stash_kind  INTEGER NOT NULL DEFAULT 0,
+            stash_type  INTEGER NOT NULL DEFAULT 0,
+            page        INTEGER NOT NULL DEFAULT 0,
+            gold        INTEGER NOT NULL DEFAULT 0,
+            width       INTEGER NOT NULL DEFAULT 0,
+            height      INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (profile, owner, name, stash_kind, page)
+        ) STRICT;
+        """;
+
+    // Every table that hangs off a character is a function of its name, for the same reason as
+    // ContainerTable: a migration has to build the new shape beside the old one, and it must be
+    // the shape a fresh file gets. The table is the one place the shape is written.
+
+    /// <summary>
+    /// One row per captured character: the player wearer's identity and live position. Keyed by
+    /// the profile it was reported through AND its name (see CharacterKey in the proto), with a
+    /// surrogate id for the children to hang off — a composite text key would have to be
+    /// carried into every one of them.
+    /// </summary>
+    private static string CharacterTable(string table) =>
+        $"""
+        CREATE TABLE {table} (
+            id               INTEGER PRIMARY KEY,
+            profile          TEXT    NOT NULL,
+            char_name        TEXT    NOT NULL DEFAULT '',  -- '' only until the first named report
             account          TEXT    NOT NULL DEFAULT '',
             realm            TEXT    NOT NULL DEFAULT '',
-            char_name        TEXT    NOT NULL DEFAULT '',
             char_class       INTEGER NOT NULL DEFAULT 0,
             level            INTEGER NOT NULL DEFAULT 0,
             char_flags       INTEGER NOT NULL DEFAULT 0,
@@ -141,70 +251,139 @@ internal static class CaptureSchema
             hand             INTEGER NOT NULL DEFAULT 0,
             game_id          TEXT    NOT NULL DEFAULT '',
             updated_at       INTEGER NOT NULL DEFAULT 0,  -- epoch ms, game-side assembly time
-            area_entered_at  INTEGER                      -- epoch ms; NULL until a real in-game entry
+            area_entered_at  INTEGER,                     -- epoch ms; NULL until a real in-game entry
+            UNIQUE (profile, char_name)
         ) STRICT;
+        """;
 
-        -- The active mercenary. Deleted when a keyframe arrives without one - see the dismissal
-        -- rule on CaptureStore.Apply, which is not something the engine can report directly.
-        CREATE TABLE merc (
-            profile   TEXT PRIMARY KEY REFERENCES character(profile) ON DELETE CASCADE,
-            name      TEXT    NOT NULL DEFAULT '',
-            class_id  INTEGER NOT NULL DEFAULT 0,
-            flags_ex  INTEGER NOT NULL DEFAULT 0
+    /// <summary>
+    /// The active mercenary. Deleted when a keyframe arrives without one — see the dismissal rule
+    /// on CaptureStore.Apply, which is not something the engine can report directly.
+    /// </summary>
+    private static string MercTable(string table) =>
+        $"""
+        CREATE TABLE {table} (
+            character_id  INTEGER PRIMARY KEY REFERENCES character(id) ON DELETE CASCADE,
+            name          TEXT    NOT NULL DEFAULT '',
+            class_id      INTEGER NOT NULL DEFAULT 0,
+            flags_ex      INTEGER NOT NULL DEFAULT 0
         ) STRICT;
+        """;
 
-        -- Merged wearer stats: GetStat off FullStats, so they already carry gear contributions.
-        -- Unlike item stats these are NOT raw - the engine sign-extends per itemstatcost.
-        CREATE TABLE wearer_stat (
-            profile  TEXT    NOT NULL REFERENCES character(profile) ON DELETE CASCADE,
-            owner    INTEGER NOT NULL,
-            stat_id  INTEGER NOT NULL,
-            value    INTEGER NOT NULL,
-            PRIMARY KEY (profile, owner, stat_id)
+    /// <summary>
+    /// Merged wearer stats: GetStat off FullStats, so they already carry gear contributions.
+    /// Unlike item stats these are NOT raw — the engine sign-extends per itemstatcost.
+    /// </summary>
+    private static string WearerStatTable(string table) =>
+        $"""
+        CREATE TABLE {table} (
+            character_id  INTEGER NOT NULL REFERENCES character(id) ON DELETE CASCADE,
+            owner         INTEGER NOT NULL,
+            stat_id       INTEGER NOT NULL,
+            value         INTEGER NOT NULL,
+            PRIMARY KEY (character_id, owner, stat_id)
         ) STRICT;
+        """;
 
-        CREATE TABLE wearer_skill (
-            profile      TEXT    NOT NULL REFERENCES character(profile) ON DELETE CASCADE,
-            owner        INTEGER NOT NULL,
-            skill_id     INTEGER NOT NULL,
-            hard_points  INTEGER NOT NULL,
-            level        INTEGER NOT NULL,  -- bonused; the gear contribution is level - hard_points
-            PRIMARY KEY (profile, owner, skill_id)
+    private static string WearerSkillTable(string table) =>
+        $"""
+        CREATE TABLE {table} (
+            character_id  INTEGER NOT NULL REFERENCES character(id) ON DELETE CASCADE,
+            owner         INTEGER NOT NULL,
+            skill_id      INTEGER NOT NULL,
+            hard_points   INTEGER NOT NULL,
+            level         INTEGER NOT NULL,  -- bonused; the gear contribution is level - hard_points
+            PRIMARY KEY (character_id, owner, skill_id)
         ) STRICT;
+        """;
 
-        -- Completed quests / active waypoints, per difficulty. The engine reports only the
-        -- difficulty it is currently in, so rows for the others persist from when they were
-        -- last played - which is the point of keying by difficulty rather than replacing.
-        CREATE TABLE progression (
-            profile     TEXT    NOT NULL REFERENCES character(profile) ON DELETE CASCADE,
-            difficulty  INTEGER NOT NULL,
-            kind        INTEGER NOT NULL,  -- 0 quest, 1 waypoint
-            entry_id    INTEGER NOT NULL,
-            PRIMARY KEY (profile, difficulty, kind, entry_id)
+    /// <summary>
+    /// Completed quests / active waypoints, per difficulty. The engine reports only the
+    /// difficulty it is currently in, so rows for the others persist from when they were last
+    /// played — which is the point of keying by difficulty rather than replacing.
+    /// </summary>
+    private static string ProgressionTable(string table) =>
+        $"""
+        CREATE TABLE {table} (
+            character_id  INTEGER NOT NULL REFERENCES character(id) ON DELETE CASCADE,
+            difficulty    INTEGER NOT NULL,
+            kind          INTEGER NOT NULL,  -- 0 quest, 1 waypoint
+            entry_id      INTEGER NOT NULL,
+            PRIMARY KEY (character_id, difficulty, kind, entry_id)
         ) STRICT;
+        """;
 
-        -- Lifetime kill counts, accumulated from the per-send deltas the engine reports.
-        -- Regular monsters are keyed by (class id, SpecType rarity) and super-uniques by
-        -- SuperUniques.txt index; super_unique keeps the two disjoint, so a super-unique is
-        -- never also counted under its class.
-        CREATE TABLE kill (
-            profile       TEXT    NOT NULL REFERENCES character(profile) ON DELETE CASCADE,
+    /// <summary>
+    /// Lifetime kill counts, accumulated from the per-send deltas the engine reports. Regular
+    /// monsters are keyed by (class id, SpecType rarity) and super-uniques by SuperUniques.txt
+    /// index; super_unique keeps the two disjoint, so a super-unique is never also counted under
+    /// its class.
+    /// </summary>
+    private static string KillTable(string table) =>
+        $"""
+        CREATE TABLE {table} (
+            character_id  INTEGER NOT NULL REFERENCES character(id) ON DELETE CASCADE,
             difficulty    INTEGER NOT NULL,
             super_unique  INTEGER NOT NULL,
             entry_id      INTEGER NOT NULL,
             spec          INTEGER NOT NULL,
             count         INTEGER NOT NULL,
-            PRIMARY KEY (profile, difficulty, super_unique, entry_id, spec)
+            PRIMARY KEY (character_id, difficulty, super_unique, entry_id, spec)
         ) STRICT;
+        """;
 
-        -- Lifetime milliseconds spent per area, accumulated from the gap between in-game updates.
-        CREATE TABLE area_time (
-            profile       TEXT    NOT NULL REFERENCES character(profile) ON DELETE CASCADE,
+    /// <summary>Lifetime milliseconds spent per area, accumulated from the gap between in-game updates.</summary>
+    private static string AreaTimeTable(string table) =>
+        $"""
+        CREATE TABLE {table} (
+            character_id  INTEGER NOT NULL REFERENCES character(id) ON DELETE CASCADE,
             difficulty    INTEGER NOT NULL,
             area          INTEGER NOT NULL,
             milliseconds  INTEGER NOT NULL,
-            PRIMARY KEY (profile, difficulty, area)
+            PRIMARY KEY (character_id, difficulty, area)
         ) STRICT;
+        """;
+
+    /// <summary>
+    /// The item table's own indexes. Stated apart from the table because a migration that rebuilds
+    /// or rewrites `item` loses them with it and has to put them back.
+    /// </summary>
+    private const string ItemIndexes = """
+        CREATE INDEX item_by_container ON item(container_id);
+        CREATE INDEX item_by_root      ON item(root_id);
+        CREATE INDEX item_by_character ON item(character_id);
+        -- Not optional: parent_id is a self-referencing FK with ON DELETE CASCADE, and SQLite
+        -- enforces that by probing the child table once per deleted row. Unindexed it degrades
+        -- to a full scan of `item` per row, on the hottest write path there is (every container
+        -- replacement and every game change), under the store's single lock — measured at 1369ms
+        -- vs 4ms over 40k rows, and it worsens quadratically.
+        CREATE INDEX item_by_parent    ON item(parent_id);
+        -- "Find my SoJ" is a (quality, file_index) pair, since the game overloads file_index per
+        -- quality. PARTIAL on purpose: unqualified `quality = 7` is better served by a scan, and
+        -- an unconditional index here made those searches measurably worse by tempting the
+        -- planner. file_index is -1 until an item is identified, so the predicate also skips
+        -- exactly the rows that can never match.
+        --
+        -- The partial predicate only pays off because the search repeats it verbatim: SQLite uses
+        -- a partial index only where the query's own terms IMPLY the index's, and `file_index = ?`
+        -- does not imply `>= 0`. See SearchQueryBuilder.AppendIdentity.
+        CREATE INDEX item_by_specific   ON item(quality, file_index) WHERE file_index >= 0;
+        """;
+
+    private static readonly string Ddl = $"""
+        {CharacterTable("character")}
+
+        {MercTable("merc")}
+
+        {WearerStatTable("wearer_stat")}
+
+        {WearerSkillTable("wearer_skill")}
+
+        {ProgressionTable("progression")}
+
+        {KillTable("kill")}
+
+        {AreaTimeTable("area_time")}
 
         {ContainerTable("container")}
 
@@ -222,7 +401,6 @@ internal static class CaptureSchema
             parent_id     INTEGER REFERENCES item(id) ON DELETE CASCADE,
             root_id       INTEGER NOT NULL,
             socket_index  INTEGER,  -- NULL when parent_id IS NULL
-            profile       TEXT    NOT NULL,  -- denormalised: search filters by profile before joining
 
             gid           INTEGER NOT NULL,
             unit_type     INTEGER NOT NULL,
@@ -304,7 +482,14 @@ internal static class CaptureSchema
             damage_2h_min    INTEGER,
             damage_2h_max    INTEGER,
             damage_throw_min INTEGER,
-            damage_throw_max INTEGER
+            damage_throw_max INTEGER,
+
+            -- Denormalised from the container, so a search can filter by character before it
+            -- joins anything. LAST, and without a REFERENCES clause, because that is the one shape
+            -- ALTER TABLE ADD COLUMN can produce — the 2→3 migration adds it in place rather than
+            -- rewriting the store's largest table — and a fresh file must match a migrated one.
+            -- A character's deletion still reaches these rows: through container, which cascades.
+            character_id     INTEGER NOT NULL DEFAULT 0
         ) STRICT;
 
         -- One leaf stat array off the item's statlist chain. state_no and flags are the game's
@@ -373,15 +558,7 @@ internal static class CaptureSchema
             PRIMARY KEY (item_id, stat_id, layer)
         ) STRICT, WITHOUT ROWID;
 
-        CREATE INDEX item_by_container ON item(container_id);
-        CREATE INDEX item_by_root      ON item(root_id);
-        CREATE INDEX item_by_profile   ON item(profile);
-        -- Not optional: parent_id is a self-referencing FK with ON DELETE CASCADE, and SQLite
-        -- enforces that by probing the child table once per deleted row. Unindexed it degrades
-        -- to a full scan of `item` per row, on the hottest write path there is (every container
-        -- replacement and every game change), under the store's single lock — measured at 1369ms
-        -- vs 4ms over 40k rows, and it worsens quadratically.
-        CREATE INDEX item_by_parent    ON item(parent_id);
+        {ItemIndexes}
         -- ordinal carried so the index also SATISFIES the read path's `ORDER BY item_id, ordinal`
         -- (a page of items is read with one query over every list it owns), which on item_id alone
         -- costs a temp B-tree sort over the whole page. `stat` gets the same ordering for free
@@ -410,17 +587,6 @@ internal static class CaptureSchema
         -- — and value otherwise. Carrying only one leaves the other's searches uncovered, paying a
         -- table lookup per matching row for a column the index could have held.
         CREATE INDEX merged_by_stat    ON merged_stat(stat_id, layer, item_id, value, value_host);
-
-        -- "Find my SoJ" is a (quality, file_index) pair, since the game overloads file_index per
-        -- quality. PARTIAL on purpose: unqualified `quality = 7` is better served by a scan, and
-        -- an unconditional index here made those searches measurably worse by tempting the
-        -- planner. file_index is -1 until an item is identified, so the predicate also skips
-        -- exactly the rows that can never match.
-        --
-        -- The partial predicate only pays off because the search repeats it verbatim: SQLite uses
-        -- a partial index only where the query's own terms IMPLY the index's, and `file_index = ?`
-        -- does not imply `>= 0`. See SearchQueryBuilder.AppendIdentity.
-        CREATE INDEX item_by_specific   ON item(quality, file_index) WHERE file_index >= 0;
         """;
 
     /// <summary>

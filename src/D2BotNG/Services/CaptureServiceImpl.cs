@@ -15,24 +15,28 @@ namespace D2BotNG.Services;
 /// unlike v1 character state they are not streamed — an inventory carries every item's stat
 /// lists, which is far too much to push through the event stream on every change. Clients pull
 /// instead.
+///
+/// Every endpoint is keyed by <see cref="CharacterKey" /> — profile AND character name — because
+/// one profile can hold several captures (a mule profile, one per mule it logs into).
 /// </summary>
 public class CaptureServiceImpl : CaptureService.CaptureServiceBase
 {
     private readonly CaptureStore _store;
+    private readonly CaptureEngine _engine;
     private readonly EventBroadcaster _events;
 
-    public CaptureServiceImpl(CaptureStore store, EventBroadcaster events)
+    public CaptureServiceImpl(CaptureStore store, CaptureEngine engine, EventBroadcaster events)
     {
         _store = store;
+        _engine = engine;
         _events = events;
     }
 
-    public override Task<Character> GetCharacter(ProfileRequest request,
-        ServerCallContext context)
+    public override Task<Character> GetCharacter(CharacterKey request, ServerCallContext context)
     {
-        var character = _store.GetCharacter(RequireProfile(request));
+        var character = _store.GetCharacter(Require(request));
         if (character == null)
-            throw new RpcException(new Status(StatusCode.NotFound, $"No capture for profile '{request.Profile}'"));
+            throw new RpcException(new Status(StatusCode.NotFound, $"No capture for {Describe(request)}"));
 
         return Task.FromResult(character);
     }
@@ -52,17 +56,24 @@ public class CaptureServiceImpl : CaptureService.CaptureServiceBase
         }
     }
 
-    public override Task<Empty> ResetKills(ProfileRequest request, ServerCallContext context)
+    public override Task<Empty> ResetKills(CharacterKey request, ServerCallContext context)
     {
-        var profile = RequireProfile(request);
-        Announce(profile, _store.ResetKills(profile));
+        Announce(_store.ResetKills(Require(request)));
         return Task.FromResult(new Empty());
     }
 
-    public override Task<Empty> ResetAreaTime(ProfileRequest request, ServerCallContext context)
+    public override Task<Empty> ResetAreaTime(CharacterKey request, ServerCallContext context)
     {
-        var profile = RequireProfile(request);
-        Announce(profile, _store.ResetAreaTime(profile));
+        Announce(_store.ResetAreaTime(Require(request)));
+        return Task.FromResult(new Empty());
+    }
+
+    public override Task<Empty> ForgetCharacter(CharacterKey request, ServerCallContext context)
+    {
+        // Through the engine rather than the store, because forgetting changes the LIST and the
+        // engine is what announces list changes. A capture that was not there is not an error:
+        // the caller wanted it gone, and it is.
+        _engine.ForgetCharacter(Require(request));
         return Task.FromResult(new Empty());
     }
 
@@ -74,21 +85,24 @@ public class CaptureServiceImpl : CaptureService.CaptureServiceBase
     /// query, but a second window — or the same one after the profile has stopped, where no further
     /// snapshot is ever coming — would keep showing the totals that were just cleared.
     /// </summary>
-    private void Announce(string profile, CharacterSummary? summary)
+    private void Announce(CharacterSummary? summary)
     {
-        // Null means the store is disabled, so nothing was deleted and there is nothing to say.
+        // Null means the store is disabled or the character is unknown, so nothing was deleted
+        // and there is nothing to say.
         if (summary == null) return;
 
         _events.Broadcast(new Event
         {
             Timestamp = Timestamp.FromDateTime(DateTime.UtcNow),
-            CaptureChanged = new CaptureChanged { Profile = profile, Summary = summary },
+            CaptureChanged = new CaptureChanged { Key = summary.Key, Summary = summary },
         });
     }
 
-    /// <summary>Every endpoint here is keyed by profile; an empty one would silently do nothing.</summary>
-    private static string RequireProfile(ProfileRequest request) =>
+    /// <summary>A key with no profile names nothing; the name half may legitimately be empty.</summary>
+    private static CharacterKey Require(CharacterKey request) =>
         string.IsNullOrEmpty(request.Profile)
             ? throw new RpcException(new Status(StatusCode.InvalidArgument, "profile is required"))
-            : request.Profile;
+            : request;
+
+    private static string Describe(CharacterKey key) => $"'{key.Name}' via profile '{key.Profile}'";
 }

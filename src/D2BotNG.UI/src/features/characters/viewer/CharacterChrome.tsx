@@ -206,6 +206,7 @@ export function CharacterChrome({
   facts,
   online,
   selector,
+  actions,
   inventory,
   statsAndSkills,
   progression,
@@ -215,6 +216,8 @@ export function CharacterChrome({
   online: boolean;
   /** The name, which doubles as the character picker — owned by the shell, not by either view. */
   selector: ReactNode;
+  /** Character-level actions, right-aligned in the header line beside the last-seen caption. */
+  actions?: ReactNode;
   inventory: ReactNode;
   statsAndSkills: ReactNode;
   progression: ReactNode;
@@ -252,8 +255,9 @@ export function CharacterChrome({
             {[facts.account, facts.realm].filter(Boolean).join(" · ")}
           </span>
         )}
-        <span className="ml-auto text-xs text-zinc-500">
+        <span className="ml-auto flex items-center gap-2 text-xs text-zinc-500">
           {formatLastSeen(facts.updatedAt, online)}
+          {actions}
         </span>
       </div>
 

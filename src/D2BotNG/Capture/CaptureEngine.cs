@@ -120,9 +120,41 @@ public sealed class CaptureEngine : IHostedService
             Timestamp = Timestamp.FromDateTime(DateTime.UtcNow),
             CaptureChanged = new CaptureChanged
             {
-                Profile = profile,
+                Key = summary.Key,
                 Summary = summary,
             },
+        });
+    }
+
+    /// <summary>
+    /// Carries a profile's captures across a rename, then re-announces the whole list: every one
+    /// of its characters changed key, and a per-capture change event names one key, not two.
+    /// </summary>
+    public void RenameProfile(string oldName, string newName)
+    {
+        _store.RenameProfile(oldName, newName);
+        BroadcastSnapshot();
+    }
+
+    /// <summary>
+    /// Drops one character's capture and re-announces the list, which is one entry shorter. A
+    /// removal has no summary to carry, so it is the snapshot rather than a change event.
+    /// </summary>
+    public bool ForgetCharacter(CharacterKey key)
+    {
+        if (!_store.ForgetCharacter(key)) return false;
+        BroadcastSnapshot();
+        return true;
+    }
+
+    private void BroadcastSnapshot()
+    {
+        var snapshot = new CapturesSnapshot();
+        snapshot.Characters.AddRange(_store.ListCharacters());
+        _events.Broadcast(new Event
+        {
+            Timestamp = Timestamp.FromDateTime(DateTime.UtcNow),
+            CapturesSnapshot = snapshot,
         });
     }
 }

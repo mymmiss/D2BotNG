@@ -9,16 +9,20 @@
  *    to push per profile per snapshot when a manager can be running hundreds. This is the app's
  *    only React Query *query*.
  *
- * Nothing polls. The server's `CaptureChanged` bumps a per-profile revision in the event store,
- * and the detail below refetches when the revision for the profile it is showing moves — so an
+ * Nothing polls. The server's `CaptureChanged` bumps a per-capture revision in the event store,
+ * and the detail below refetches when the revision for the character it is showing moves — so an
  * idle manager is silent, a busy one is current, and the heavy payload only ever moves for the
  * character actually on screen.
+ *
+ * A capture is identified by its `CharacterKey` — profile AND character name — everywhere here,
+ * as on the wire: one profile can hold several (a mule profile, one per mule it logs into).
  */
 
 import { useEffect } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import type { CharacterKey } from "@/generated/captures_pb";
 import { captureClient } from "@/lib/grpc-client";
-import { useCaptureRevision } from "@/stores/event-store";
+import { captureMapKey, useCaptureRevision } from "@/stores/event-store";
 import { useDebounced } from "./useDebounced";
 
 /**
@@ -35,14 +39,16 @@ import { useDebounced } from "./useDebounced";
 const REFETCH_DEBOUNCE_MS = 750;
 
 export const captureKeys = {
-  character: (profile: string) => ["captures", "character", profile] as const,
+  /** The two halves as two elements — a query key is a structural match, not a string. */
+  character: (key: CharacterKey) =>
+    ["captures", "character", key.profile, key.name] as const,
 };
 
 /**
  * One character, whole: both wearers with every container, item and stat list. Skipped entirely
- * when no profile is given, so selecting a v1 character costs nothing.
+ * when no key is given, so selecting a v1 character costs nothing.
  */
-export function useCapturedCharacter(profile: string | null | undefined) {
+export function useCapturedCharacter(key: CharacterKey | null | undefined) {
   const queryClient = useQueryClient();
 
   /**
@@ -50,18 +56,19 @@ export function useCapturedCharacter(profile: string | null | undefined) {
    *
    * The throttle holds a single value across a character switch, so a bare revision let the newly
    * selected character be invalidated at the number belonging to the one before it. Carrying the
-   * profile makes a switch a change of value rather than a value inherited — and it has to be a
+   * identity makes a switch a change of value rather than a value inherited — and it has to be a
    * primitive, since a fresh object every render would never compare equal and so never settle.
    *
    * Revision first, so the separator is unambiguous: a profile name may contain anything.
    */
+  const identity = key ? captureMapKey(key) : "";
   const settled = useDebounced(
-    `${useCaptureRevision(profile)}@${profile ?? ""}`,
+    `${useCaptureRevision(key)}@${identity}`,
     REFETCH_DEBOUNCE_MS,
   );
 
   // Invalidating a stable key rather than putting the revision IN the key: one cache entry per
-  // profile instead of one per revision, and React Query keeps showing the previous capture while
+  // capture instead of one per revision, and React Query keeps showing the previous capture while
   // the next is in flight, so the gear does not blink on every change.
   //
   // Deliberately not depending on the live revision as well: that would run this on every bump and
@@ -71,16 +78,21 @@ export function useCapturedCharacter(profile: string | null | undefined) {
     const revision = Number(settled.slice(0, at));
     // Revision 0 is "nothing reported yet", and a settled value from the previously open character
     // says nothing about this one.
-    if (!profile || revision === 0 || settled.slice(at + 1) !== profile) return;
+    if (!key || revision === 0 || settled.slice(at + 1) !== identity) return;
     void queryClient.invalidateQueries({
-      queryKey: captureKeys.character(profile),
+      queryKey: captureKeys.character(key),
     });
-  }, [queryClient, profile, settled]);
+    // Keyed on the identity STRING, not the key object: a caller that builds a fresh key per
+    // render would otherwise re-run this — and invalidate — on every render while the character
+    // is live. The key read inside is the one belonging to that identity, since a change of
+    // identity is what re-runs the effect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queryClient, identity, settled]);
 
   return useQuery({
-    queryKey: captureKeys.character(profile ?? ""),
-    queryFn: () => captureClient.getCharacter({ profile: profile! }),
-    enabled: !!profile,
+    queryKey: key ? captureKeys.character(key) : ["captures", "character"],
+    queryFn: () => captureClient.getCharacter(key!),
+    enabled: !!key,
     // The stream says when this is stale; nothing else should second-guess it.
     refetchOnWindowFocus: false,
     staleTime: Infinity,

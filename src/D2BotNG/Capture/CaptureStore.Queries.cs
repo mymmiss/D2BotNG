@@ -32,30 +32,29 @@ public sealed partial class CaptureStore
     }
 
     /// <summary>
-    /// Every summary, or just one profile's. Same columns either way.
+    /// Every summary, or just one character's. Same columns either way.
     ///
     /// Takes no lock: the callers do, and <see cref="Apply" /> reads its result inside the very
     /// transaction's lock so the summary it hands back cannot describe some later snapshot.
     /// </summary>
-    private List<CharacterSummary> ReadSummaries(string? profile)
+    private List<CharacterSummary> ReadSummaries(long? characterId)
     {
         var summaries = new List<CharacterSummary>();
         if (_connection == null) return summaries;
 
-        (string Name, object? Value)[] args = profile == null ? [] : [("$profile", profile)];
+        (string Name, object? Value)[] args = characterId == null ? [] : [("$c", characterId)];
         Read(
             $"""
              SELECT profile, account, realm, char_flags, ladder, difficulty,
                     char_name, char_class, level, updated_at
                FROM character
-              {(profile == null ? "" : "WHERE profile = $profile")}
-              ORDER BY profile
+              {(characterId == null ? "" : "WHERE id = $c")}
+              ORDER BY profile, char_name
              """,
             reader => summaries.Add(new CharacterSummary
             {
-                Profile = reader.GetString(0),
+                Key = ReadKey(reader),
                 Identity = ReadIdentity(reader),
-                Name = reader.GetString(6),
                 ClassId = reader.GetInt32(7),
                 Level = reader.GetInt32(8),
                 UpdatedAt = ToTimestamp(reader.GetInt64(9)),
@@ -66,8 +65,8 @@ public sealed partial class CaptureStore
     }
 
     /// <summary>
-    /// Both character queries select the identity columns first and in the same order, so one
-    /// reader serves both. A NULL difficulty means no identity section has named one yet; 0
+    /// Both character queries select the key and identity columns first and in the same order, so
+    /// one reader serves both. A NULL difficulty means no identity section has named one yet; 0
     /// (Normal) is the closest truth to serve, and the store itself keeps the distinction.
     /// </summary>
     private static Identity ReadIdentity(SqliteDataReader reader) => new()
@@ -79,49 +78,60 @@ public sealed partial class CaptureStore
         Difficulty = reader.IsDBNull(5) ? 0 : reader.GetInt32(5),
     };
 
+    private static CharacterKey ReadKey(SqliteDataReader reader) => new()
+    {
+        Profile = reader.GetString(0),
+        Name = reader.GetString(6),
+    };
+
     /// <summary>
     /// One character, whole — both wearers with every container, item, stat list and socket
     /// filler. This is what a viewer renders from, so nothing is left unloaded.
     /// </summary>
-    public Character? GetCharacter(string profile)
+    public Character? GetCharacter(CharacterKey key)
     {
         lock (_lock)
         {
             if (_connection == null) return null;
 
             Character? character = null;
+            long characterId = 0;
             Read(
                 """
                 SELECT profile, account, realm, char_flags, ladder, difficulty,
                        char_name, char_class, flags_ex, area, hand, game_id, updated_at,
-                       area_entered_at
-                  FROM character WHERE profile = $p
+                       area_entered_at, id
+                  FROM character WHERE profile = $p AND char_name = $n
                 """,
-                reader => character = new Character
+                reader =>
                 {
-                    Profile = reader.GetString(0),
-                    Identity = ReadIdentity(reader),
-                    // The player IS the character — name, class, flags and position live on the
-                    // wearer, exactly as the engine reports them.
-                    Player = new Unit
+                    characterId = reader.GetInt64(14);
+                    character = new Character
                     {
-                        UnitType = PlayerUnitType,
-                        Name = reader.GetString(6),
-                        ClassId = reader.GetInt32(7),
-                        FlagsEx = (uint)reader.GetInt64(8),
-                        Area = reader.GetInt32(9),
-                        Hand = reader.GetInt32(10),
-                    },
-                    GameId = reader.GetString(11),
-                    UpdatedAt = ToTimestamp(reader.GetInt64(12)),
-                    AreaEnteredAt = reader.IsDBNull(13) ? null : ToTimestamp(reader.GetInt64(13)),
+                        Key = ReadKey(reader),
+                        Identity = ReadIdentity(reader),
+                        // The player IS the character — name, class, flags and position live on
+                        // the wearer, exactly as the engine reports them.
+                        Player = new Unit
+                        {
+                            UnitType = PlayerUnitType,
+                            Name = reader.GetString(6),
+                            ClassId = reader.GetInt32(7),
+                            FlagsEx = (uint)reader.GetInt64(8),
+                            Area = reader.GetInt32(9),
+                            Hand = reader.GetInt32(10),
+                        },
+                        GameId = reader.GetString(11),
+                        UpdatedAt = ToTimestamp(reader.GetInt64(12)),
+                        AreaEnteredAt = reader.IsDBNull(13) ? null : ToTimestamp(reader.GetInt64(13)),
+                    };
                 },
-                ("$p", profile));
+                ("$p", key.Profile), ("$n", key.Name));
 
             if (character == null) return null;
 
-            Populate(character);
-            ReadContainers(character);
+            Populate(character, characterId);
+            ReadContainers(character, characterId);
 
             return character;
         }
@@ -181,9 +191,11 @@ public sealed partial class CaptureStore
 
             using (var command = Command(
                        $"""
-                        {sql.Ctes}SELECT i.id, i.profile, c.owner, c.name, c.stash_kind, c.label, c.page
+                        {sql.Ctes}SELECT i.id, ch.profile, ch.char_name, c.owner, c.name, c.stash_kind, c.label,
+                               c.page
                           FROM item i
-                          JOIN container c ON c.id = i.container_id{sql.OrderJoin}
+                          JOIN container c ON c.id = i.container_id
+                          JOIN character ch ON ch.id = i.character_id{sql.OrderJoin}
                          WHERE {sql.Where}
                          ORDER BY {sql.OrderBy}
                          LIMIT {limit} OFFSET {request.Offset}
@@ -194,12 +206,12 @@ public sealed partial class CaptureStore
                 {
                     matches.Add((reader.GetInt64(0), new ItemMatch
                     {
-                        Profile = reader.GetString(1),
-                        Owner = (Owner)reader.GetInt32(2),
-                        Container = reader.GetString(3),
-                        StashKind = (StashTabKind)reader.GetInt32(4),
-                        StashName = reader.GetString(5),
-                        Page = reader.GetInt32(6),
+                        Character = new CharacterKey { Profile = reader.GetString(1), Name = reader.GetString(2) },
+                        Owner = (Owner)reader.GetInt32(3),
+                        Container = reader.GetString(4),
+                        StashKind = (StashTabKind)reader.GetInt32(5),
+                        StashName = reader.GetString(6),
+                        Page = reader.GetInt32(7),
                     }));
                 }
             }
@@ -235,15 +247,15 @@ public sealed partial class CaptureStore
 
     /// <summary>Everything hanging off the character row: the merc, both wearers' stats and
     /// skills, and the accumulated totals.</summary>
-    private void Populate(Character character)
+    private void Populate(Character character, long characterId)
     {
-        var byOwner = ("$p", (object?)character.Profile);
+        var byOwner = ("$c", (object?)characterId);
 
         // The merc row is read FIRST because it decides whether there is a merc at all. Its
         // stats and skills are fingerprinted separately from its unit document, so owner-1 rows
         // can outlive it; conjuring a wearer from those would serve a mercenary that was never
         // captured, with no name and the wrong unit type.
-        Read("SELECT name, class_id, flags_ex FROM merc WHERE profile = $p",
+        Read("SELECT name, class_id, flags_ex FROM merc WHERE character_id = $c",
             reader => character.Merc = new Unit
             {
                 // A mercenary is a wearer, so it rebuilds into the same message as the player.
@@ -254,7 +266,7 @@ public sealed partial class CaptureStore
             },
             byOwner);
 
-        Read("SELECT owner, stat_id, value FROM wearer_stat WHERE profile = $p ORDER BY owner, stat_id",
+        Read("SELECT owner, stat_id, value FROM wearer_stat WHERE character_id = $c ORDER BY owner, stat_id",
             reader => Wearer(reader.GetInt32(0))?.Stats.Add(
                 new Stat { Id = reader.GetInt32(1), Value = reader.GetInt64(2) }),
             byOwner);
@@ -262,7 +274,7 @@ public sealed partial class CaptureStore
         Read(
             """
             SELECT owner, skill_id, hard_points, level FROM wearer_skill
-             WHERE profile = $p ORDER BY owner, skill_id
+             WHERE character_id = $c ORDER BY owner, skill_id
             """,
             reader => Wearer(reader.GetInt32(0))?.Skills.Add(new Skill
             {
@@ -276,7 +288,7 @@ public sealed partial class CaptureStore
         Read(
             """
             SELECT difficulty, kind, entry_id FROM progression
-             WHERE profile = $p ORDER BY difficulty, kind, entry_id
+             WHERE character_id = $c ORDER BY difficulty, kind, entry_id
             """,
             reader =>
             {
@@ -296,7 +308,7 @@ public sealed partial class CaptureStore
         Read(
             """
             SELECT difficulty, super_unique, entry_id, spec, count FROM kill
-             WHERE profile = $p ORDER BY difficulty, super_unique, entry_id, spec
+             WHERE character_id = $c ORDER BY difficulty, super_unique, entry_id, spec
             """,
             reader => character.Kills.Add(new Kill
             {
@@ -311,7 +323,7 @@ public sealed partial class CaptureStore
         Read(
             """
             SELECT difficulty, area, milliseconds FROM area_time
-             WHERE profile = $p ORDER BY difficulty, area
+             WHERE character_id = $c ORDER BY difficulty, area
             """,
             reader => character.AreaTime.Add(new AreaTime
             {
@@ -337,7 +349,7 @@ public sealed partial class CaptureStore
     /// per page, so the stash's rows are folded back under `pages` — leaving the served document
     /// the same one that was captured.
     /// </summary>
-    private void ReadContainers(Character character)
+    private void ReadContainers(Character character, long characterId)
     {
         // Both owners in one query, for the same reason the items below are read in one: a
         // per-wearer call costs a container query plus ReadItemTree's three, so a character with a
@@ -349,8 +361,8 @@ public sealed partial class CaptureStore
                    """
                    SELECT id, owner, name, label, stash_kind, stash_type, page, gold, width, height
                      FROM container
-                    WHERE profile = $p ORDER BY owner, name, stash_kind, page
-                   """, null, ("$p", character.Profile)))
+                    WHERE character_id = $c ORDER BY owner, name, stash_kind, page
+                   """, null, ("$c", characterId)))
         {
             using var reader = command.ExecuteReader();
             while (reader.Read())

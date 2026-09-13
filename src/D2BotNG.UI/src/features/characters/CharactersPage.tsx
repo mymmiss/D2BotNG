@@ -390,7 +390,7 @@ export function CharactersPage() {
   // running only v2 engines has an empty `useCharacters()` and a full capture store.
   const captured = useCapturedSummaries();
   const capturedProfiles = useMemo(
-    () => (captured ?? []).map((c) => c.profile),
+    () => (captured ?? []).map((c) => c.key?.profile ?? ""),
     [captured],
   );
 
@@ -420,7 +420,7 @@ export function CharactersPage() {
           </TabPanel>
           {capturedProfiles.length > 0 && (
             <TabPanel>
-              <ItemSearchTab profiles={capturedProfiles} />
+              <ItemSearchTab characters={captured ?? []} />
             </TabPanel>
           )}
           <TabPanel>

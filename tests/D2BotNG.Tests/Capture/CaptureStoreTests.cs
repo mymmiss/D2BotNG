@@ -51,6 +51,9 @@ public class CaptureStoreTests : IDisposable
     /// <summary>Parses exactly the way ingest does — straight into the wire proto.</summary>
     private static Snapshot Parse(string json) => ProtobufJsonConfig.Parser.Parse<Snapshot>(json);
 
+    /// <summary>The key of a capture; the fixtures' character is "Sorc" unless a test says otherwise.</summary>
+    private static CharacterKey Key(string profile, string name = "Sorc") => new() { Profile = profile, Name = name };
+
     private void Apply(string json) => _store.Apply("Bot1", Parse(json));
 
     [Fact]
@@ -58,8 +61,8 @@ public class CaptureStoreTests : IDisposable
     {
         Apply(Keyframe());
 
-        var character = _store.GetCharacter("Bot1")!;
-        Assert.Equal("Bot1", character.Profile);
+        var character = _store.GetCharacter(Key("Bot1"))!;
+        Assert.Equal("Bot1", character.Key.Profile);
         Assert.Equal("Acct", character.Identity.Account);
         Assert.Equal("USWest", character.Identity.Realm);
         Assert.Equal("Sorc", character.Player.Name);
@@ -96,8 +99,8 @@ public class CaptureStoreTests : IDisposable
         // own message precisely so "no gear here" is a statement about the endpoint rather than
         // about the character — there is no containers field to misread.
         var summary = Assert.Single(_store.ListCharacters());
-        Assert.Equal("Bot1", summary.Profile);
-        Assert.Equal("Sorc", summary.Name);
+        Assert.Equal("Bot1", summary.Key.Profile);
+        Assert.Equal("Sorc", summary.Key.Name);
         Assert.Equal(1, summary.ClassId);
         Assert.Equal(90, summary.Level); // denormalised stat 12, so the list need not carry stats
         Assert.Equal("Acct", summary.Identity.Account);
@@ -110,7 +113,7 @@ public class CaptureStoreTests : IDisposable
     {
         Apply(Keyframe());
 
-        var detail = _store.GetCharacter("Bot1")!;
+        var detail = _store.GetCharacter(Key("Bot1"))!;
         var inventory = detail.Player.Containers.Inventory;
         Assert.Equal(10, inventory.Width);
 
@@ -154,7 +157,7 @@ public class CaptureStoreTests : IDisposable
     {
         Apply(Keyframe());
 
-        var belt = _store.GetCharacter("Bot1")!.Player.Containers.Belt;
+        var belt = _store.GetCharacter(Key("Bot1"))!.Player.Containers.Belt;
         var potion = Assert.Single(belt.Items);
         // Slot 5 in a 4-wide belt is column 1, and row 0 is the BOTTOM row in game, so on a
         // top-down grid it lands at y = 4 - 1 - 1 = 2.
@@ -546,7 +549,7 @@ public class CaptureStoreTests : IDisposable
     public void AStatTheWearerStopsReportingIsRemoved()
     {
         Apply(Keyframe());
-        Assert.Equal(123456, _store.GetCharacter("Bot1")!.Player.Stats.Single(s => s.Id == 14).Value);
+        Assert.Equal(123456, _store.GetCharacter(Key("Bot1"))!.Player.Stats.Single(s => s.Id == 14).Value);
 
         // Stats are UPSERTED now rather than deleted and reinserted, and an upsert cannot retract.
         // The producer sends a fixed curated set so this should never happen — but if it ever
@@ -556,7 +559,7 @@ public class CaptureStoreTests : IDisposable
                "player":{"name":"Sorc","stats":[{"id":12,"value":91}]}}
               """);
 
-        var stats = _store.GetCharacter("Bot1")!.Player.Stats;
+        var stats = _store.GetCharacter(Key("Bot1"))!.Player.Stats;
         Assert.Equal(91, Assert.Single(stats).Value);
         Assert.Equal(12, stats[0].Id);
     }
@@ -565,7 +568,7 @@ public class CaptureStoreTests : IDisposable
     public void AGearGrantedSkillDisappearsWhenTheGearComesOff()
     {
         Apply(Keyframe());
-        Assert.Equal(48, Assert.Single(_store.GetCharacter("Bot1")!.Player.Skills).SkillId);
+        Assert.Equal(48, Assert.Single(_store.GetCharacter(Key("Bot1"))!.Player.Skills).SkillId);
 
         // The load-bearing half of the same rule. A skill list is NOT fixed — GetAllSkills
         // includes what gear grants — so unequipping the item that granted one has to remove it.
@@ -575,7 +578,7 @@ public class CaptureStoreTests : IDisposable
                "player":{"name":"Sorc","skills":[{"skill":36,"hard":1,"level":3}]}}
               """);
 
-        var skill = Assert.Single(_store.GetCharacter("Bot1")!.Player.Skills);
+        var skill = Assert.Single(_store.GetCharacter(Key("Bot1"))!.Player.Skills);
         Assert.Equal(36, skill.SkillId);
         Assert.Equal(3, skill.Level);
     }
@@ -594,7 +597,7 @@ public class CaptureStoreTests : IDisposable
                          "skills":[{"skill":48,"hard":20,"level":31}]}}
               """);
 
-        var player = _store.GetCharacter("Bot1")!.Player;
+        var player = _store.GetCharacter(Key("Bot1"))!.Player;
         Assert.Equal(2, player.Stats.Count);
         Assert.Equal(93, player.Stats.Single(s => s.Id == 12).Value);
         Assert.Equal(999999, player.Stats.Single(s => s.Id == 14).Value);
@@ -623,7 +626,7 @@ public class CaptureStoreTests : IDisposable
                        "skills":[{"skill":36,"hard":1,"level":1}]}}
             """);
 
-        var player = _store.GetCharacter("Bot1")!.Player;
+        var player = _store.GetCharacter(Key("Bot1"))!.Player;
         Assert.Equal(83, player.Area);
         Assert.Equal(1, player.Hand);
         Assert.Equal(36, Assert.Single(player.Skills).SkillId);
@@ -648,7 +651,7 @@ public class CaptureStoreTests : IDisposable
                         "title":"Crystal Sword","location":1,"x":4,"y":0,"w":2,"h":3}]}}}}
             """);
 
-        Assert.Null(_store.GetCharacter("Bot1")!.Merc);
+        Assert.Null(_store.GetCharacter(Key("Bot1"))!.Merc);
 
         // The premise, so this cannot pass by the section having been ignored wholesale: the
         // owner-1 rows really did land, and only the read path declines to build a wearer for them.
@@ -667,7 +670,7 @@ public class CaptureStoreTests : IDisposable
              ]}}}}
             """);
 
-        var belt = _store.GetCharacter("Bot1")!.Player.Containers.Belt;
+        var belt = _store.GetCharacter(Key("Bot1"))!.Player.Containers.Belt;
 
         // The slot index is decomposed against the default 4x4, so those are the dimensions the
         // cells mean. Serving the reported 0x0 alongside them would leave a renderer with a
@@ -685,7 +688,7 @@ public class CaptureStoreTests : IDisposable
 
         // Storage keeps one row per page, and the read folds them back under the holder.
         // The stash is a Stash, not a Container: it has no items or grid of its own, only pages.
-        var stash = _store.GetCharacter("Bot1")!.Player.Containers.Stash;
+        var stash = _store.GetCharacter(Key("Bot1"))!.Player.Containers.Stash;
         var page = Assert.Single(stash.Pages);
         Assert.Equal("Personal", page.Name);
         Assert.Equal(0, page.Index);
@@ -699,7 +702,7 @@ public class CaptureStoreTests : IDisposable
     {
         Apply(Keyframe());
 
-        var detail = _store.GetCharacter("Bot1")!;
+        var detail = _store.GetCharacter(Key("Bot1"))!;
         Assert.Equal("Rogue", detail.Merc.Name);
         Assert.Equal(85, detail.Merc.Stats.Single(s => s.Id == 12).Value);
         Assert.NotNull(detail.Merc.Containers.Equipped);
@@ -708,7 +711,7 @@ public class CaptureStoreTests : IDisposable
         // when it cannot resolve one for a single sample, and throwing the merc away on that
         // would blink it out of the UI every time.
         Apply("""{"schemaVersion":2,"gameId":"Game#1","updatedAt":1717000002000,"merc":null}""");
-        Assert.NotNull(_store.GetCharacter("Bot1")!.Merc);
+        Assert.NotNull(_store.GetCharacter(Key("Bot1"))!.Merc);
 
         // A keyframe is authoritative: the engine emits merc on every one, so its absence there
         // means there genuinely is no merc.
@@ -718,7 +721,7 @@ public class CaptureStoreTests : IDisposable
 
         // The whole wearer goes, gear included — there is no longer a separate place for its
         // containers to survive in, which is part of the point of folding them onto the Unit.
-        detail = _store.GetCharacter("Bot1")!;
+        detail = _store.GetCharacter(Key("Bot1"))!;
         Assert.Null(detail.Merc);
     }
 
@@ -729,7 +732,7 @@ public class CaptureStoreTests : IDisposable
         // The keyframe rule must not fire when the merc IS present on it.
         Apply(Keyframe().Replace("Game#1", "Game#2"));
 
-        Assert.Equal("Rogue", _store.GetCharacter("Bot1")!.Merc.Name);
+        Assert.Equal("Rogue", _store.GetCharacter(Key("Bot1"))!.Merc.Name);
     }
 
     [Fact]
@@ -743,7 +746,7 @@ public class CaptureStoreTests : IDisposable
                "kills":{"byClass":[{"id":58,"spec":2,"count":4}]}}
               """);
 
-        var detail = _store.GetCharacter("Bot1")!;
+        var detail = _store.GetCharacter(Key("Bot1"))!;
         Assert.Equal("Sorc", detail.Player.Name);
         // Level is not a stored field any more — it is stat 12 off the player's merged stats.
         Assert.Equal(90, detail.Player.Stats.Single(s => s.Id == 12).Value);
@@ -769,7 +772,9 @@ public class CaptureStoreTests : IDisposable
                "kills":{"byClass":[{"id":58,"spec":2,"count":3}]}}
               """);
 
-        Assert.Empty(_store.GetCharacter("Bot1")!.Kills);
+        // Nothing has named the character yet, so its row is the profile's unnamed one — which
+        // the keyframe below adopts rather than creating a second row beside it.
+        Assert.Empty(_store.GetCharacter(Key("Bot1", ""))!.Kills);
 
         // Once identity names the difficulty, counting resumes under the right one.
         Apply(Keyframe()); // difficulty 2 (Hell)
@@ -778,7 +783,7 @@ public class CaptureStoreTests : IDisposable
                "kills":{"byClass":[{"id":58,"spec":2,"count":4}]}}
               """);
 
-        var kill = Assert.Single(_store.GetCharacter("Bot1")!.Kills, k => !k.SuperUnique);
+        var kill = Assert.Single(_store.GetCharacter(Key("Bot1"))!.Kills, k => !k.SuperUnique);
         Assert.Equal(2, kill.Difficulty);
         Assert.Equal(7, kill.Count); // 3 from the keyframe + 4, and nothing under Normal
     }
@@ -787,13 +792,13 @@ public class CaptureStoreTests : IDisposable
     public void ANewGameDropsThePreviousGamesItems()
     {
         Apply(Keyframe());
-        Assert.NotNull(_store.GetCharacter("Bot1")!.Player.Containers.Inventory);
+        Assert.NotNull(_store.GetCharacter(Key("Bot1"))!.Player.Containers.Inventory);
 
         // Item gids are only valid within one game, so a game change clears them — but the
         // accumulated analytics have to survive it.
         Apply("""{"schemaVersion":2,"gameId":"Game#2","keyframe":true,"updatedAt":1717000003000}""");
 
-        var detail = _store.GetCharacter("Bot1")!;
+        var detail = _store.GetCharacter(Key("Bot1"))!;
         Assert.Null(detail.Player.Containers.Inventory);
         Assert.Equal("Sorc", detail.Player.Name);
         Assert.NotEmpty(detail.Kills);
@@ -811,7 +816,7 @@ public class CaptureStoreTests : IDisposable
 
         var scoped = _store.SearchItems(new SearchItemsRequest { Profiles = { "Bot1" } });
         Assert.Equal(3, scoped.Total);
-        Assert.All(scoped.Results, match => Assert.Equal("Bot1", match.Profile));
+        Assert.All(scoped.Results, match => Assert.Equal("Bot1", match.Character.Profile));
         Assert.Equal(6, _store.SearchItems(new SearchItemsRequest()).Total);
 
         // Bot1 rebuilds a container, reports a shrinking stat set (which prunes), then changes
@@ -826,10 +831,10 @@ public class CaptureStoreTests : IDisposable
               {"schemaVersion":2,"gameId":"Game#2","keyframe":true,"updatedAt":1717000020000}
               """);
 
-        Assert.Null(_store.GetCharacter("Bot1")!.Player.Containers.Inventory);
+        Assert.Null(_store.GetCharacter(Key("Bot1"))!.Player.Containers.Inventory);
         Assert.Empty(_store.SearchItems(new SearchItemsRequest { Profiles = { "Bot1" } }).Results);
 
-        var other = _store.GetCharacter("Bot2")!;
+        var other = _store.GetCharacter(Key("Bot2", "Barb"))!;
         Assert.Equal("Barb", other.Player.Name);
         Assert.Single(other.Player.Containers.Inventory.Items);
         Assert.Equal(123456, other.Player.Stats.Single(s => s.Id == 14).Value);
@@ -850,7 +855,7 @@ public class CaptureStoreTests : IDisposable
         var pair = _store.SearchItems(new SearchItemsRequest { Profiles = { "Bot1", "Bot3" } });
 
         Assert.Equal(6, pair.Total);
-        Assert.Equal(["Bot1", "Bot3"], pair.Results.Select(m => m.Profile).Distinct().Order());
+        Assert.Equal(["Bot1", "Bot3"], pair.Results.Select(m => m.Character.Profile).Distinct().Order());
         Assert.Equal(9, _store.SearchItems(new SearchItemsRequest()).Total);
     }
 
@@ -1146,13 +1151,13 @@ public class CaptureStoreTests : IDisposable
         // Same game, 30s later, still in area 40: the gap is credited to where it was spent.
         Apply("""{"schemaVersion":2,"gameId":"Game#1","updatedAt":1717000030000}""");
 
-        var areaTime = Assert.Single(_store.GetCharacter("Bot1")!.AreaTime);
+        var areaTime = Assert.Single(_store.GetCharacter(Key("Bot1"))!.AreaTime);
         Assert.Equal(40, areaTime.Area);
         Assert.Equal(2, areaTime.Difficulty);
         Assert.Equal(30000, areaTime.Milliseconds);
 
-        _store.ResetAreaTime("Bot1");
-        Assert.Empty(_store.GetCharacter("Bot1")!.AreaTime);
+        _store.ResetAreaTime(Key("Bot1"));
+        Assert.Empty(_store.GetCharacter(Key("Bot1"))!.AreaTime);
     }
 
     /// <summary>Where the store puts the database, for the recovery tests below.</summary>
@@ -1171,7 +1176,7 @@ public class CaptureStoreTests : IDisposable
 
         // The old contents are gone, which is fine — this store is derived state — but it must
         // come back up rather than staying disabled until someone deletes the file by hand.
-        Assert.Equal("Sorc", Assert.Single(reopened.ListCharacters()).Name);
+        Assert.Equal("Sorc", Assert.Single(reopened.ListCharacters()).Key.Name);
     }
 
     /// <summary>
@@ -1193,7 +1198,7 @@ public class CaptureStoreTests : IDisposable
         reopened.Open();
         reopened.Apply("Bot1", Parse(Keyframe()));
 
-        Assert.Equal("Sorc", Assert.Single(reopened.ListCharacters()).Name);
+        Assert.Equal("Sorc", Assert.Single(reopened.ListCharacters()).Key.Name);
     }
 
     /// <summary>
@@ -1218,12 +1223,13 @@ public class CaptureStoreTests : IDisposable
                "kills":{"byClass":[{"id":58,"spec":2,"count":4}]}}
               """);
         _store.Dispose();
+        DowngradeToVersionTwo(DatabasePath);
         DowngradeContainerTableToVersionOne(DatabasePath);
 
         using var reopened = new CaptureStore(NullLogger<CaptureStore>.Instance, new Paths(_directory), _tooltip);
         reopened.Open();
 
-        var character = reopened.GetCharacter("Bot1")!;
+        var character = reopened.GetCharacter(Key("Bot1"))!;
         Assert.Equal("Sorc", character.Player.Name);
         Assert.Single(character.Player.Containers.Inventory.Items);
         var page = Assert.Single(character.Player.Containers.Stash.Pages);
@@ -1238,7 +1244,7 @@ public class CaptureStoreTests : IDisposable
 
         // And the upgraded file takes the new shape: a shared page beside the personal one.
         reopened.Apply("Bot1", Parse(TwoKindStash()));
-        Assert.Equal(2, reopened.GetCharacter("Bot1")!.Player.Containers.Stash.Pages.Count);
+        Assert.Equal(2, reopened.GetCharacter(Key("Bot1"))!.Player.Containers.Stash.Pages.Count);
     }
 
     /// <summary>
@@ -1254,6 +1260,7 @@ public class CaptureStoreTests : IDisposable
     {
         Apply(Keyframe());
         _store.Dispose();
+        DowngradeToVersionTwo(DatabasePath);
         DowngradeContainerTableToVersionOne(DatabasePath);
         ExecuteRaw(DatabasePath, "CREATE TABLE container_v2 (x INTEGER)");
         var items = ScalarRaw(DatabasePath, "SELECT COUNT(*) FROM item");
@@ -1316,14 +1323,14 @@ public class CaptureStoreTests : IDisposable
     {
         Apply(TwoKindStash());
 
-        var pages = _store.GetCharacter("Bot1")!.Player.Containers.Stash.Pages;
+        var pages = _store.GetCharacter(Key("Bot1"))!.Player.Containers.Stash.Pages;
         // Personal 0 and shared 0 are different pages: the kind is part of the key.
         Assert.Equal(2, pages.Count);
 
         var personal = pages.Single(p => p.Kind == StashTabKind.Personal);
         Assert.Equal(0, personal.Index);
         Assert.Equal(StashTabType.Normal, personal.Type);
-        Assert.Equal("", personal.Name);
+        Assert.Equal("Main", personal.Name);
         Assert.Equal(2500000u, personal.Gold);
         Assert.Equal("rin", Assert.Single(personal.Items).Code);
 
@@ -1339,6 +1346,7 @@ public class CaptureStoreTests : IDisposable
         var match = Assert.Single(found.Results);
         Assert.Equal(StashTabKind.Personal, match.StashKind);
         Assert.Equal(0, match.Page);
+        Assert.Equal("Main", match.StashName);
     }
 
     /// <summary>
@@ -1351,10 +1359,271 @@ public class CaptureStoreTests : IDisposable
     {
         Apply(Keyframe()); // its stash page carries only index/name/width/height/items
 
-        var page = Assert.Single(_store.GetCharacter("Bot1")!.Player.Containers.Stash.Pages);
+        var page = Assert.Single(_store.GetCharacter(Key("Bot1"))!.Player.Containers.Stash.Pages);
         Assert.Equal(StashTabKind.Personal, page.Kind);
         Assert.Equal(StashTabType.Normal, page.Type);
         Assert.Equal(0u, page.Gold);
+    }
+
+    /// <summary>
+    /// A version-2 file — one character per profile, every table keyed by the profile string —
+    /// comes up with its character under the (profile, name) key, its items, and its accumulated
+    /// totals, and then accepts a second character under the same profile, which version 2 could
+    /// not hold at all.
+    /// </summary>
+    [Fact]
+    public void AVersionTwoDatabaseIsMigratedAndKeepsItsRows()
+    {
+        Apply(Keyframe());
+        Apply("""
+              {"schemaVersion":2,"gameId":"Game#1","updatedAt":1717000010000,
+               "kills":{"byClass":[{"id":58,"spec":2,"count":4}]}}
+              """);
+        _store.Dispose();
+        DowngradeToVersionTwo(DatabasePath);
+
+        using var reopened = new CaptureStore(NullLogger<CaptureStore>.Instance, new Paths(_directory), _tooltip);
+        reopened.Open();
+
+        var character = reopened.GetCharacter(Key("Bot1"))!;
+        Assert.Equal("Sorc", character.Player.Name);
+        Assert.Single(character.Player.Containers.Inventory.Items);
+        Assert.Equal("rin", Assert.Single(Assert.Single(character.Player.Containers.Stash.Pages).Items).Code);
+        Assert.Equal("Rogue", character.Merc.Name);
+        Assert.Equal(7, character.Kills.Single(k => k.Id == 58 && !k.SuperUnique).Count);
+        Assert.True(File.Exists(BackupPath(2)));
+
+        // Items followed their character through the in-place rewrite: search still finds them.
+        Assert.Equal(3, reopened.SearchItems(new SearchItemsRequest { Profiles = { "Bot1" } }).Total);
+
+        reopened.Apply("Bot1", Parse(KeyframeFor("Barb", "Game#2")));
+        Assert.Equal(2, reopened.ListCharacters().Count);
+    }
+
+    /// <summary>
+    /// The reason the key is a pair: a mule profile logs into one character after another, and
+    /// each keeps its own capture. A snapshot that names no character — the volatile stats alone —
+    /// lands on the one the profile is playing NOW, which is the last one named.
+    /// </summary>
+    [Fact]
+    public void AProfilePlayingSeveralCharactersKeepsEachCapture()
+    {
+        Apply(Keyframe());
+        Apply(KeyframeFor("Barb", "Game#2"));
+
+        var summaries = _store.ListCharacters();
+        Assert.Equal(["Barb", "Sorc"], summaries.Select(s => s.Key.Name).Order());
+        Assert.All(summaries, s => Assert.Equal("Bot1", s.Key.Profile));
+
+        // The first character's capture is intact — nothing was overwritten by the second.
+        var sorc = _store.GetCharacter(Key("Bot1"))!;
+        Assert.Single(sorc.Player.Containers.Inventory.Items);
+        Assert.Equal(3, sorc.Kills.Single(k => k.Id == 58 && !k.SuperUnique).Count);
+
+        var barb = _store.GetCharacter(Key("Bot1", "Barb"))!;
+        Assert.Equal(4, barb.Player.ClassId);
+        Assert.Empty(barb.Kills);
+
+        // Unnamed: the profile's current character is Barb, so the stat update is Barb's.
+        Apply("""
+              {"schemaVersion":2,"gameId":"Game#2","updatedAt":1717000020000,
+               "player":{"stats":[{"id":12,"value":40},{"id":14,"value":7}]}}
+              """);
+        Assert.Equal(7, _store.GetCharacter(Key("Bot1", "Barb"))!.Player.Stats.Single(s => s.Id == 14).Value);
+        Assert.Equal(123456, _store.GetCharacter(Key("Bot1"))!.Player.Stats.Single(s => s.Id == 14).Value);
+
+        // Search can name one of them, or the whole profile.
+        Assert.Equal(1, _store.SearchItems(new SearchItemsRequest { Characters = { Key("Bot1", "Barb") } }).Total);
+        Assert.Equal(4, _store.SearchItems(new SearchItemsRequest { Profiles = { "Bot1" } }).Total);
+        var narrowed = _store.SearchItems(new SearchItemsRequest { Characters = { Key("Bot1", "Barb") } });
+        Assert.Equal("Barb", Assert.Single(narrowed.Results).Character.Name);
+    }
+
+    [Fact]
+    public void RenamingAProfileCarriesItsCaptures()
+    {
+        Apply(Keyframe());
+        Apply(KeyframeFor("Barb", "Game#2"));
+
+        _store.RenameProfile("Bot1", "Bot9");
+
+        Assert.Null(_store.GetCharacter(Key("Bot1")));
+        Assert.All(_store.ListCharacters(), s => Assert.Equal("Bot9", s.Key.Profile));
+        Assert.Single(_store.GetCharacter(Key("Bot9"))!.Player.Containers.Inventory.Items);
+        Assert.Equal(4, _store.SearchItems(new SearchItemsRequest { Profiles = { "Bot9" } }).Total);
+
+        // The renamed profile keeps reporting; an unnamed snapshot still knows its character.
+        Apply("Bot9", """
+                      {"schemaVersion":2,"gameId":"Game#2","updatedAt":1717000020000,
+                       "player":{"stats":[{"id":12,"value":40},{"id":14,"value":7}]}}
+                      """);
+        Assert.Equal(7, _store.GetCharacter(Key("Bot9", "Barb"))!.Player.Stats.Single(s => s.Id == 14).Value);
+    }
+
+    [Fact]
+    public void ForgettingACharacterDropsEverythingItOwned()
+    {
+        Apply(Keyframe());
+        Apply(KeyframeFor("Barb", "Game#2"));
+
+        Assert.True(_store.ForgetCharacter(Key("Bot1")));
+        Assert.False(_store.ForgetCharacter(Key("Bot1")));
+
+        Assert.Equal("Barb", Assert.Single(_store.ListCharacters()).Key.Name);
+        Assert.Null(_store.GetCharacter(Key("Bot1")));
+        // Only Barb's one item is left: the cascades took Sorc's containers, items and lists.
+        Assert.Equal(1, _store.SearchItems(new SearchItemsRequest()).Total);
+        Assert.Equal(1L, ScalarRaw(DatabasePath, "SELECT COUNT(*) FROM item"));
+        Assert.Equal(0L, ScalarRaw(DatabasePath, "SELECT COUNT(*) FROM kill"));
+    }
+
+    private void Apply(string profile, string json) => _store.Apply(profile, Parse(json));
+
+    /// <summary>A keyframe for a different character: a level-40 Barbarian with one ring in its stash.</summary>
+    private static string KeyframeFor(string name, string gameId) =>
+        """
+        {"schemaVersion":2,"gameId":"GAME_ID","keyframe":true,"updatedAt":1717000015000,
+         "identity":{"account":"Acct","realm":"USWest","difficulty":1,"charFlags":36,"ladder":true},
+         "player":{"unitType":0,"classId":4,"flagsEx":32,"name":"CHAR_NAME",
+           "stats":[{"id":12,"value":40},{"id":14,"value":5}],
+           "containers":{"stash":{"pages":[{"index":0,"width":6,"height":8,"items":[
+             {"unitType":4,"classId":522,"code":"rin","quality":4,"itemFlags":0,"format":0,
+              "fileIndex":-1,"itemLevel":30,"rarePrefix":0,"rareSuffix":0,"autoAffix":0,
+              "magicPrefix":[0,0,0],"magicSuffix":[0,0,0],"earLevel":0,"playerName":"","gfxIndex":1,
+              "title":"Ring","statsLists":[{"stateNo":0,"flags":1,"stats":[{"id":7,"value":20}]}],
+              "gid":2001,"location":7,"x":0,"y":0,"w":1,"h":1}]}]}}}}
+        """.Replace("GAME_ID", gameId).Replace("CHAR_NAME", name);
+
+    /// <summary>
+    /// Rebuilds every character-keyed table in its version-2 shape — keyed by the profile string,
+    /// one character per profile — and stamps the file as version 2. The fixture is a downgrade
+    /// of a current file rather than a checked-in copy, for the reason given on the version-1
+    /// helper: it is the tables that changed, and only those are touched.
+    /// </summary>
+    private static void DowngradeToVersionTwo(string path)
+    {
+        ExecuteRaw(path,
+            """
+            PRAGMA foreign_keys = OFF;
+            CREATE TABLE character_v2 (
+                profile          TEXT    PRIMARY KEY,
+                account          TEXT    NOT NULL DEFAULT '',
+                realm            TEXT    NOT NULL DEFAULT '',
+                char_name        TEXT    NOT NULL DEFAULT '',
+                char_class       INTEGER NOT NULL DEFAULT 0,
+                level            INTEGER NOT NULL DEFAULT 0,
+                char_flags       INTEGER NOT NULL DEFAULT 0,
+                flags_ex         INTEGER NOT NULL DEFAULT 0,
+                ladder           INTEGER NOT NULL DEFAULT 0,
+                difficulty       INTEGER,
+                area             INTEGER NOT NULL DEFAULT 0,
+                hand             INTEGER NOT NULL DEFAULT 0,
+                game_id          TEXT    NOT NULL DEFAULT '',
+                updated_at       INTEGER NOT NULL DEFAULT 0,
+                area_entered_at  INTEGER
+            ) STRICT;
+            INSERT INTO character_v2 (profile, account, realm, char_name, char_class, level, char_flags, flags_ex,
+                                      ladder, difficulty, area, hand, game_id, updated_at, area_entered_at)
+            SELECT profile, account, realm, char_name, char_class, level, char_flags, flags_ex,
+                   ladder, difficulty, area, hand, game_id, updated_at, area_entered_at FROM character;
+
+            CREATE TABLE merc_v2 (
+                profile   TEXT PRIMARY KEY REFERENCES character(profile) ON DELETE CASCADE,
+                name      TEXT    NOT NULL DEFAULT '',
+                class_id  INTEGER NOT NULL DEFAULT 0,
+                flags_ex  INTEGER NOT NULL DEFAULT 0
+            ) STRICT;
+            INSERT INTO merc_v2 SELECT c.profile, t.name, t.class_id, t.flags_ex
+              FROM merc t JOIN character c ON c.id = t.character_id;
+
+            CREATE TABLE wearer_stat_v2 (
+                profile  TEXT    NOT NULL REFERENCES character(profile) ON DELETE CASCADE,
+                owner    INTEGER NOT NULL,
+                stat_id  INTEGER NOT NULL,
+                value    INTEGER NOT NULL,
+                PRIMARY KEY (profile, owner, stat_id)
+            ) STRICT;
+            INSERT INTO wearer_stat_v2 SELECT c.profile, t.owner, t.stat_id, t.value
+              FROM wearer_stat t JOIN character c ON c.id = t.character_id;
+
+            CREATE TABLE wearer_skill_v2 (
+                profile      TEXT    NOT NULL REFERENCES character(profile) ON DELETE CASCADE,
+                owner        INTEGER NOT NULL,
+                skill_id     INTEGER NOT NULL,
+                hard_points  INTEGER NOT NULL,
+                level        INTEGER NOT NULL,
+                PRIMARY KEY (profile, owner, skill_id)
+            ) STRICT;
+            INSERT INTO wearer_skill_v2 SELECT c.profile, t.owner, t.skill_id, t.hard_points, t.level
+              FROM wearer_skill t JOIN character c ON c.id = t.character_id;
+
+            CREATE TABLE progression_v2 (
+                profile     TEXT    NOT NULL REFERENCES character(profile) ON DELETE CASCADE,
+                difficulty  INTEGER NOT NULL,
+                kind        INTEGER NOT NULL,
+                entry_id    INTEGER NOT NULL,
+                PRIMARY KEY (profile, difficulty, kind, entry_id)
+            ) STRICT;
+            INSERT INTO progression_v2 SELECT c.profile, t.difficulty, t.kind, t.entry_id
+              FROM progression t JOIN character c ON c.id = t.character_id;
+
+            CREATE TABLE kill_v2 (
+                profile       TEXT    NOT NULL REFERENCES character(profile) ON DELETE CASCADE,
+                difficulty    INTEGER NOT NULL,
+                super_unique  INTEGER NOT NULL,
+                entry_id      INTEGER NOT NULL,
+                spec          INTEGER NOT NULL,
+                count         INTEGER NOT NULL,
+                PRIMARY KEY (profile, difficulty, super_unique, entry_id, spec)
+            ) STRICT;
+            INSERT INTO kill_v2 SELECT c.profile, t.difficulty, t.super_unique, t.entry_id, t.spec, t.count
+              FROM kill t JOIN character c ON c.id = t.character_id;
+
+            CREATE TABLE area_time_v2 (
+                profile       TEXT    NOT NULL REFERENCES character(profile) ON DELETE CASCADE,
+                difficulty    INTEGER NOT NULL,
+                area          INTEGER NOT NULL,
+                milliseconds  INTEGER NOT NULL,
+                PRIMARY KEY (profile, difficulty, area)
+            ) STRICT;
+            INSERT INTO area_time_v2 SELECT c.profile, t.difficulty, t.area, t.milliseconds
+              FROM area_time t JOIN character c ON c.id = t.character_id;
+
+            CREATE TABLE container_v2 (
+                id          INTEGER PRIMARY KEY,
+                profile     TEXT    NOT NULL REFERENCES character(profile) ON DELETE CASCADE,
+                owner       INTEGER NOT NULL,
+                name        TEXT    NOT NULL,
+                label       TEXT    NOT NULL DEFAULT '',
+                stash_kind  INTEGER NOT NULL DEFAULT 0,
+                stash_type  INTEGER NOT NULL DEFAULT 0,
+                page        INTEGER NOT NULL DEFAULT 0,
+                gold        INTEGER NOT NULL DEFAULT 0,
+                width       INTEGER NOT NULL DEFAULT 0,
+                height      INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (profile, owner, name, stash_kind, page)
+            ) STRICT;
+            INSERT INTO container_v2 (id, profile, owner, name, label, stash_kind, stash_type, page, gold, width, height)
+            SELECT t.id, c.profile, t.owner, t.name, t.label, t.stash_kind, t.stash_type, t.page, t.gold, t.width,
+                   t.height
+              FROM container t JOIN character c ON c.id = t.character_id;
+
+            DROP INDEX item_by_character;
+            ALTER TABLE item ADD COLUMN profile TEXT NOT NULL DEFAULT '';
+            UPDATE item SET profile = (SELECT c.profile FROM character c WHERE c.id = item.character_id);
+            ALTER TABLE item DROP COLUMN character_id;
+            CREATE INDEX item_by_profile ON item(profile);
+
+            DROP TABLE merc;         ALTER TABLE merc_v2 RENAME TO merc;
+            DROP TABLE wearer_stat;  ALTER TABLE wearer_stat_v2 RENAME TO wearer_stat;
+            DROP TABLE wearer_skill; ALTER TABLE wearer_skill_v2 RENAME TO wearer_skill;
+            DROP TABLE progression;  ALTER TABLE progression_v2 RENAME TO progression;
+            DROP TABLE kill;         ALTER TABLE kill_v2 RENAME TO kill;
+            DROP TABLE area_time;    ALTER TABLE area_time_v2 RENAME TO area_time;
+            DROP TABLE container;    ALTER TABLE container_v2 RENAME TO container;
+            DROP TABLE character;    ALTER TABLE character_v2 RENAME TO character;
+            PRAGMA user_version = 2;
+            """);
     }
 
     /// <summary>A stash with a personal and a shared page, both at index 0.</summary>
@@ -1362,7 +1631,7 @@ public class CaptureStoreTests : IDisposable
         """
         {"schemaVersion":2,"gameId":"Game#1","keyframe":true,"updatedAt":1717000000000,
          "player":{"name":"Sorc","containers":{"stash":{"pages":[
-           {"kind":0,"index":0,"type":0,"name":"","gold":2500000,"width":6,"height":8,"items":[
+           {"kind":0,"index":0,"type":0,"name":"Main","gold":2500000,"width":6,"height":8,"items":[
              {"unitType":4,"classId":522,"code":"rin","quality":4,"itemFlags":0,"format":0,
               "fileIndex":-1,"itemLevel":50,"rarePrefix":0,"rareSuffix":0,"autoAffix":0,
               "magicPrefix":[0,0,0],"magicSuffix":[0,0,0],"earLevel":0,"playerName":"","gfxIndex":2,
@@ -1417,8 +1686,8 @@ public class CaptureStoreTests : IDisposable
         reopened.Open();
 
         var character = Assert.Single(reopened.ListCharacters());
-        Assert.Equal("Sorc", character.Name);
-        Assert.Single(reopened.GetCharacter("Bot1")!.Player.Containers.Inventory.Items);
+        Assert.Equal("Sorc", character.Key.Name);
+        Assert.Single(reopened.GetCharacter(Key("Bot1"))!.Player.Containers.Inventory.Items);
     }
 
     [Fact]
@@ -1438,7 +1707,7 @@ public class CaptureStoreTests : IDisposable
         reopened.Apply("Bot1", Parse(
             """{"schemaVersion":2,"gameId":"Game#1","updatedAt":1717000240000}"""));
 
-        Assert.Empty(reopened.GetCharacter("Bot1")!.AreaTime);
+        Assert.Empty(reopened.GetCharacter(Key("Bot1"))!.AreaTime);
     }
 
     [Fact]

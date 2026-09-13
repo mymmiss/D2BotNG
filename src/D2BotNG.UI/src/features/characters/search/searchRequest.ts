@@ -9,6 +9,7 @@
 
 import {
   ItemColumn,
+  type CharacterKey,
   type Ordering,
   type SearchItemsRequest,
   type StatCondition,
@@ -221,8 +222,13 @@ const QUALITY_SET = 5;
 const QUALITY_UNIQUE = 7;
 
 export interface PropertyFilters {
-  /** Owning profile names. Empty is every character, so there is no "all" member to contradict. */
+  /**
+   * Where to look, at two grains that OR together: whole profiles, and single captures under a
+   * profile that holds several. Both empty is every character, so there is no "all" member to
+   * contradict.
+   */
   profiles: string[];
+  characters: CharacterKey[];
   qualities: number[];
   tiers: Tier[];
   /** Base items, uniques, set items and runewords, from one list. */
@@ -268,6 +274,7 @@ export interface PropertyFilters {
 
 export const EMPTY_PROPERTIES: PropertyFilters = {
   profiles: [],
+  characters: [],
   qualities: [],
   tiers: [],
   items: [],
@@ -712,6 +719,7 @@ export function buildSearchRequest(
   return {
     $typeName: "d2bot.captures.SearchItemsRequest",
     profiles: properties.profiles,
+    characters: properties.characters,
     classIds: properties.items.flatMap((i) =>
       i.kind === "base" ? [i.id] : [],
     ),
@@ -764,6 +772,7 @@ export function buildSearchRequest(
 export function requestHasFilter(request: SearchItemsRequest): boolean {
   return (
     request.profiles.length > 0 ||
+    request.characters.length > 0 ||
     request.conditions.length > 0 ||
     request.groups.length > 0 ||
     request.classIds.length > 0 ||

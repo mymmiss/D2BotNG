@@ -18,6 +18,7 @@ import {
   MagnifyingGlassIcon,
 } from "@heroicons/react/24/outline";
 import { Button, Card, CardContent, EmptyState } from "@/components/ui";
+import type { CharacterSummary } from "@/generated/captures_pb";
 import { CtrlBreakdownHint } from "@/features/items";
 import { useToolkit } from "@/hooks/useToolkit";
 import { useCtrlWheelScroll } from "@/hooks/useCtrlWheelScroll";
@@ -38,7 +39,12 @@ import { Panel } from "./controls";
 
 const PAGE_SIZE = 48;
 
-export function ItemSearchTab({ profiles }: { profiles: string[] }) {
+export function ItemSearchTab({
+  characters,
+}: {
+  /** Every capture the store holds, for the "where to look" picker. */
+  characters: CharacterSummary[];
+}) {
   // Ctrl is this view's breakdown key, so Ctrl+scroll here means "read on down the results" rather
   // than "zoom the app". The scrolling still happens; only the zooming is taken away.
   const wheelRef = useCtrlWheelScroll<HTMLDivElement>();
@@ -202,7 +208,7 @@ export function ItemSearchTab({ profiles }: { profiles: string[] }) {
                 <PropertyFilterPanel
                   filters={properties}
                   onChange={setProperties}
-                  profiles={profiles}
+                  characters={characters}
                   engine={engine}
                 />
               </Panel>

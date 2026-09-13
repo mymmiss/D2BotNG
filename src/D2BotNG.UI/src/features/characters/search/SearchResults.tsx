@@ -224,7 +224,15 @@ const ResultRow = memo(function ResultRow({
           <div>
             <dt className="sr-only">Character</dt>
             <dd className="break-words font-medium text-zinc-300">
-              {match.profile}
+              {match.character?.name || match.character?.profile}
+            </dd>
+          </div>
+          {/* The profile as well as the name: a mule's name says which mule, the profile says
+              which account's stash it sits in. */}
+          <div>
+            <dt className="sr-only">Profile</dt>
+            <dd className="break-words text-zinc-500">
+              {match.character?.profile}
             </dd>
           </div>
           <div>
@@ -417,7 +425,7 @@ export function SearchResults({
           return (
             <div
               // gid is unique only within one game, so it takes the profile and slot to be a key.
-              key={`${match.profile}-${match.owner}-${match.container}-${match.stashKind}-${match.page}-${item.gid}-${item.x}-${item.y}`}
+              key={`${match.character?.profile}-${match.character?.name}-${match.owner}-${match.container}-${match.stashKind}-${match.page}-${item.gid}-${item.x}-${item.y}`}
               data-index={virtual.index}
               ref={virtualizer.measureElement}
               style={{

@@ -8,17 +8,21 @@
  * Everything else is projected straight out of the capture.
  */
 
-import { useMemo, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import type { TooltipEngine } from "d2itemtoolkit";
+import { ConfirmationDialog } from "@/components/ui";
 import {
   StashTabKind,
   StashTabType,
   type Character as CapturedCharacter,
+  type CharacterKey,
 } from "@/generated/captures_pb";
 import {
+  useForgetCapturedCharacter,
   useResetCapturedAreaTime,
   useResetCapturedKills,
 } from "@/hooks/useCapturedResets";
+import { captureMapKey } from "@/stores/event-store";
 import { CtrlBreakdownHint } from "@/features/items";
 import { CharacterChrome } from "./CharacterChrome";
 import { InventoryTab, type LabeledContainer } from "./InventoryTab";
@@ -76,12 +80,23 @@ export function CapturedCharacterView({
 }) {
   const resetKills = useResetCapturedKills();
   const resetAreaTime = useResetCapturedAreaTime();
+  const forget = useForgetCapturedCharacter();
+  const [forgetOpen, setForgetOpen] = useState(false);
+
+  // The server always sets the key; the fallback only satisfies the type.
+  const key: CharacterKey = captured.key ?? {
+    $typeName: "d2bot.captures.CharacterKey",
+    profile: "",
+    name: "",
+  };
+  // One primitive per capture, for the panels that remount per character.
+  const identityKey = captureMapKey(key);
 
   const player = captured.player;
   const identity = captured.identity;
 
   const facts: CharacterFacts = {
-    profile: captured.profile,
+    profile: key.profile,
     charName: player?.name ?? "",
     account: identity?.account ?? "",
     realm: identity?.realm ?? "",
@@ -174,7 +189,7 @@ export function CapturedCharacterView({
     return out;
   }, [captured.progression]);
 
-  const displayName = facts.charName || captured.profile;
+  const displayName = facts.charName || key.profile;
 
   return (
     <>
@@ -187,7 +202,7 @@ export function CapturedCharacterView({
         selector={selector}
         inventory={
           <InventoryTab
-            profileKey={captured.profile}
+            profileKey={identityKey}
             expansion={facts.expansion}
             activeSet={facts.hand}
             gold={statOf(player?.stats, STAT_GOLD)}
@@ -205,31 +220,59 @@ export function CapturedCharacterView({
             charClass={facts.charClass}
           />
         }
+        actions={
+          <button
+            type="button"
+            onClick={() => setForgetOpen(true)}
+            title="Drop this capture — every item, kill count and time in area recorded for it"
+            className="rounded px-2 py-1 text-xs font-medium text-zinc-500 hover:bg-zinc-800 hover:text-red-400"
+          >
+            Forget
+          </button>
+        }
         progression={
           <ProgressionPanel
-            key={captured.profile}
+            key={identityKey}
             progression={progression}
             activeDifficulty={facts.difficulty}
           />
         }
         analytics={
           <AnalyticsPanel
-            key={captured.profile}
+            key={identityKey}
             displayName={displayName}
             activeDifficulty={facts.difficulty}
             // Already the flat tuples the panel counts — v2 never nested them.
             kills={captured.kills}
             areaTime={captured.areaTime}
             killsReset={{
-              onReset: () => resetKills.mutateAsync(captured.profile),
+              onReset: () => resetKills.mutateAsync(key),
               isPending: resetKills.isPending,
             }}
             areaTimeReset={{
-              onReset: () => resetAreaTime.mutateAsync(captured.profile),
+              onReset: () => resetAreaTime.mutateAsync(key),
               isPending: resetAreaTime.isPending,
             }}
           />
         }
+      />
+      {/* Forgetting is the one way a capture leaves the store: deleting the profile does not
+          take its characters with it, since the items still exist on the account. */}
+      <ConfirmationDialog
+        open={forgetOpen}
+        title="Forget character"
+        description={`Forget the capture of "${displayName}"?`}
+        message="This drops every item, kill count and time in area recorded for it. The character itself is untouched; if it reports again, a fresh capture starts."
+        confirmLabel="Forget"
+        isPending={forget.isPending}
+        onConfirm={async () => {
+          try {
+            await forget.mutateAsync(key);
+          } finally {
+            setForgetOpen(false);
+          }
+        }}
+        onCancel={() => setForgetOpen(false)}
       />
     </>
   );

@@ -51,11 +51,18 @@ public sealed partial class CaptureStore : IDisposable
     private SqliteConnection? _connection;
     private string? _path;
 
-    // Profiles that have reported since this store was opened. Purely to gate the time-in-area
-    // accrual: without it the gap between two SESSIONS would be credited to whatever area the
-    // character was last standing in. In memory rather than a column because it is erased on
-    // open anyway, so persisting it could never carry information across a restart.
-    private readonly HashSet<string> _reportedThisSession = [];
+    // Characters (by row id) that have reported since this store was opened. Purely to gate the
+    // time-in-area accrual: without it the gap between two SESSIONS would be credited to whatever
+    // area the character was last standing in. In memory rather than a column because it is
+    // erased on open anyway, so persisting it could never carry information across a restart.
+    private readonly HashSet<long> _reportedThisSession = [];
+
+    // Which character each profile is playing NOW, by row id: the one its last named snapshot
+    // was for. A partial snapshot names nothing — the player document rides its own fingerprint —
+    // so it needs this to know which of the profile's characters it belongs to. Seeded from the
+    // most recently updated row on the first unnamed snapshot after an open, and corrected by the
+    // next keyframe, which a game change always brings.
+    private readonly Dictionary<string, long> _current = [];
 
     // Statements whose text never varies, prepared once and rebound per use. Every CreateCommand
     // re-runs sqlite3_prepare_v2, and a 300-item keyframe issues on the order of twenty thousand
@@ -103,6 +110,7 @@ public sealed partial class CaptureStore : IDisposable
                 Discard();
                 _path = path;
                 _reportedThisSession.Clear();
+                _current.Clear();
 
                 try
                 {
@@ -308,7 +316,7 @@ public sealed partial class CaptureStore : IDisposable
     /// a stronger guarantee than a follow-up read could give: no other snapshot can land between
     /// the commit and the summary that is supposed to describe it.
     /// </summary>
-    /// <param name="profile">Owning profile name, the key every row hangs off.</param>
+    /// <param name="profile">The profile the snapshot was reported through.</param>
     /// <param name="snapshot">The parsed payload; absent sections are left untouched.</param>
     /// <returns>The character's summary after this snapshot, or null when the store is disabled.</returns>
     public CharacterSummary? Apply(string profile, Snapshot snapshot)
@@ -318,13 +326,14 @@ public sealed partial class CaptureStore : IDisposable
             if (_connection == null) return null;
 
             using var transaction = _connection.BeginTransaction();
-            var previous = ReadCursor(profile, transaction) ?? InsertCharacter(profile, transaction);
+            var characterId = ResolveCharacter(profile, snapshot, transaction);
+            var previous = ReadCursor(characterId, transaction);
 
             // Read here, recorded only after the commit below: a snapshot that throws rolls the
-            // transaction back, so marking the profile as seen now would leave the flag claiming
+            // transaction back, so marking the character as seen now would leave the flag claiming
             // an update landed when none did — and the next successful one would then accrue the
             // gap since the PREVIOUS session as time in area, which is exactly what this gates.
-            var reportedBefore = _reportedThisSession.Contains(profile);
+            var reportedBefore = _reportedThisSession.Contains(characterId);
 
             var gameChanged = !string.IsNullOrEmpty(snapshot.GameId) && snapshot.GameId != previous.GameId;
             if (gameChanged)
@@ -340,12 +349,12 @@ public sealed partial class CaptureStore : IDisposable
                 // the next game create, minutes for a bot. Still the right trade — serving items
                 // whose gids belong to a dead game would be worse — but if that window ever
                 // matters, the fix is a "resend everything" message, not keeping the rows.
-                Execute("DELETE FROM container WHERE profile = $p", transaction, ("$p", profile));
+                Execute("DELETE FROM container WHERE character_id = $c", transaction, ("$c", characterId));
             }
 
             var state = previous;
-            if (snapshot.Identity != null) state = ApplyIdentity(profile, snapshot.Identity, state, transaction);
-            if (snapshot.Player != null) state = ApplyPlayer(profile, snapshot.Player, state, transaction);
+            if (snapshot.Identity != null) state = ApplyIdentity(characterId, snapshot.Identity, state, transaction);
+            if (snapshot.Player != null) state = ApplyPlayer(characterId, snapshot.Player, state, transaction);
 
             // The mercenary, decided by the keyframe rather than by the payload's `merc: null`.
             // The producer emits merc on EVERY keyframe — the object, or null when there is none —
@@ -354,8 +363,8 @@ public sealed partial class CaptureStore : IDisposable
             // unset otherwise means unchanged. A merc that goes for good mid-game (a hardcore
             // death) therefore lingers until the next game, which for a bot is minutes — and in
             // exchange a merc that is simply unresolvable for one sample is not thrown away.
-            if (snapshot.Merc != null) ApplyMerc(profile, snapshot.Merc, transaction);
-            else if (snapshot.Keyframe) DismissMerc(profile, transaction);
+            if (snapshot.Merc != null) ApplyMerc(characterId, snapshot.Merc, transaction);
+            else if (snapshot.Keyframe) DismissMerc(characterId, transaction);
 
             // Progression and kills are filed UNDER a difficulty, so they must run after identity
             // — and are dropped outright when no identity has ever named one. Guessing Normal
@@ -366,9 +375,9 @@ public sealed partial class CaptureStore : IDisposable
             if (state.Difficulty is { } difficulty)
             {
                 if (snapshot.Progression != null)
-                    ApplyProgression(profile, difficulty, snapshot.Progression, transaction);
+                    ApplyProgression(characterId, difficulty, snapshot.Progression, transaction);
 
-                if (snapshot.Kills != null) ApplyKills(profile, difficulty, snapshot.Kills, transaction);
+                if (snapshot.Kills != null) ApplyKills(characterId, difficulty, snapshot.Kills, transaction);
             }
             else if (snapshot.Progression != null || snapshot.Kills != null)
             {
@@ -389,7 +398,7 @@ public sealed partial class CaptureStore : IDisposable
             {
                 var deltaMs = updatedAt - previous.UpdatedAt;
                 if (deltaMs > 0 && deltaMs <= MaxAreaTickMs && previous.Area > 0)
-                    AccrueAreaTime(profile, previousDifficulty, previous.Area, deltaMs, transaction);
+                    AccrueAreaTime(characterId, previousDifficulty, previous.Area, deltaMs, transaction);
             }
 
             // Re-stamp on a new game as well as a real area change, so a stale entry time from a
@@ -400,40 +409,161 @@ public sealed partial class CaptureStore : IDisposable
                 """
                 UPDATE character
                    SET game_id = $game, updated_at = $updated, area_entered_at = $entered
-                 WHERE profile = $p
+                 WHERE id = $c
                 """,
                 transaction,
-                ("$p", profile),
+                ("$c", characterId),
                 ("$game", string.IsNullOrEmpty(snapshot.GameId) ? previous.GameId : snapshot.GameId),
                 ("$updated", updatedAt),
                 ("$entered", areaEnteredAt));
 
             transaction.Commit();
-            _reportedThisSession.Add(profile);
-            return ReadSummaries(profile).FirstOrDefault();
+            _reportedThisSession.Add(characterId);
+            return ReadSummaries(characterId).FirstOrDefault();
         }
     }
 
-    public CharacterSummary? ResetKills(string profile) => DeleteFor("kill", profile);
+    public CharacterSummary? ResetKills(CharacterKey key) => DeleteFor("kill", key);
 
-    public CharacterSummary? ResetAreaTime(string profile) => DeleteFor("area_time", profile);
+    public CharacterSummary? ResetAreaTime(CharacterKey key) => DeleteFor("area_time", key);
 
     /// <summary>
-    /// Clears one accumulated table for a profile, and hands back the summary the same way
+    /// Clears one accumulated table for a character, and hands back the summary the same way
     /// <see cref="Apply" /> does — read under the same lock, so the caller can announce the change
     /// to every connected client rather than only the one that asked for it. Without that a second
     /// window keeps showing the totals it had, and for a STOPPED profile nothing ever arrives to
-    /// correct it.
+    /// correct it. Null when the store is disabled or the character is unknown.
     /// </summary>
-    private CharacterSummary? DeleteFor(string table, string profile)
+    private CharacterSummary? DeleteFor(string table, CharacterKey key)
     {
         lock (_lock)
         {
             if (_connection == null) return null;
-            Execute($"DELETE FROM {table} WHERE profile = $p", null, ("$p", profile));
-            return ReadSummaries(profile).FirstOrDefault();
+            if (FindCharacter(key.Profile, key.Name, null) is not { } characterId) return null;
+
+            Execute($"DELETE FROM {table} WHERE character_id = $c", null, ("$c", characterId));
+            return ReadSummaries(characterId).FirstOrDefault();
         }
     }
+
+    /// <summary>
+    /// Drops one character's capture entirely: the row, and by cascade its wearers, containers,
+    /// items and totals. The only removal there is — a profile's deletion leaves its characters in
+    /// place, since the items still exist on the account, so a character that is gone for good is
+    /// forgotten by hand. Returns whether there was one to forget.
+    /// </summary>
+    public bool ForgetCharacter(CharacterKey key)
+    {
+        lock (_lock)
+        {
+            if (_connection == null) return false;
+            if (FindCharacter(key.Profile, key.Name, null) is not { } characterId) return false;
+
+            Execute("DELETE FROM character WHERE id = $c", null, ("$c", characterId));
+            _reportedThisSession.Remove(characterId);
+            if (_current.TryGetValue(key.Profile, out var current) && current == characterId)
+                _current.Remove(key.Profile);
+
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Carries a profile's captures across a rename. A character of the same name already under
+    /// the new profile — leftovers from a profile of that name that was deleted — gives way: the
+    /// renamed profile's rows are the live ones.
+    /// </summary>
+    public void RenameProfile(string oldName, string newName)
+    {
+        lock (_lock)
+        {
+            if (_connection == null || oldName == newName) return;
+
+            using var transaction = _connection.BeginTransaction();
+            Execute(
+                """
+                DELETE FROM character
+                 WHERE profile = $new
+                   AND char_name IN (SELECT char_name FROM character WHERE profile = $old)
+                """,
+                transaction, ("$new", newName), ("$old", oldName));
+            Execute("UPDATE character SET profile = $new WHERE profile = $old", transaction,
+                ("$new", newName), ("$old", oldName));
+            transaction.Commit();
+
+            if (_current.Remove(oldName, out var current)) _current[newName] = current;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Which character
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// The character a snapshot belongs to, resolved before anything is written.
+    ///
+    /// A snapshot that carries the player document names the character outright, and that is
+    /// the case that matters: a mule profile switching characters enters a new game, and a new
+    /// game brings a keyframe. One that does not — the volatile stats alone, a container that
+    /// moved — belongs to whichever character the profile is playing now, which is the one its
+    /// last named snapshot was for, or after an open the most recently updated of its rows.
+    /// </summary>
+    private long ResolveCharacter(string profile, Snapshot snapshot, SqliteTransaction transaction)
+    {
+        // An EMPTY name names nothing: the producer sends one while the client has not resolved
+        // the character yet, and the document around it (class, area, hand, skills) is still
+        // applied — to the current character, as any unnamed snapshot is.
+        if (snapshot.Player is { HasName: true } player && player.Name.Length > 0)
+        {
+            var id = FindCharacter(profile, player.Name, transaction);
+            if (id == null)
+            {
+                // A row this profile filled before any snapshot named its character — partials
+                // into a fresh database — IS this character. Name it rather than insert beside it,
+                // or the stats and gear it already holds would sit under an empty name for good.
+                var unnamed = FindCharacter(profile, "", transaction);
+                if (unnamed != null)
+                {
+                    Execute("UPDATE character SET char_name = $n WHERE id = $c", transaction,
+                        ("$n", player.Name), ("$c", unnamed));
+                    id = unnamed;
+                }
+                else
+                {
+                    id = InsertCharacter(profile, player.Name, transaction);
+                }
+            }
+
+            _current[profile] = id.Value;
+            return id.Value;
+        }
+
+        if (_current.TryGetValue(profile, out var current)) return current;
+
+        var latest = LatestCharacter(profile, transaction) ?? InsertCharacter(profile, "", transaction);
+        _current[profile] = latest;
+        return latest;
+    }
+
+    private long? FindCharacter(string profile, string name, SqliteTransaction? transaction)
+    {
+        using var command = Command("SELECT id FROM character WHERE profile = $p AND char_name = $n",
+            transaction, ("$p", profile), ("$n", name));
+        return command.ExecuteScalar() is long id ? id : null;
+    }
+
+    /// <summary>The profile's most recently reporting character, or null when it has none.</summary>
+    private long? LatestCharacter(string profile, SqliteTransaction transaction)
+    {
+        using var command = Command(
+            "SELECT id FROM character WHERE profile = $p ORDER BY updated_at DESC, id DESC LIMIT 1",
+            transaction, ("$p", profile));
+        return command.ExecuteScalar() is long id ? id : null;
+    }
+
+    private long InsertCharacter(string profile, string name, SqliteTransaction transaction) =>
+        InsertReturningId("INSERT INTO character (profile, char_name) VALUES ($p, $n) RETURNING id",
+            transaction, ("$p", profile), ("$n", name));
 
     // -----------------------------------------------------------------------
     // Sections
@@ -446,13 +576,13 @@ public sealed partial class CaptureStore : IDisposable
     private sealed record Cursor(
         string GameId, int Area, int? Difficulty, long UpdatedAt, long? AreaEnteredAt);
 
-    private Cursor? ReadCursor(string profile, SqliteTransaction transaction)
+    private Cursor ReadCursor(long characterId, SqliteTransaction transaction)
     {
         using var command = Command(
-            "SELECT game_id, area, difficulty, updated_at, area_entered_at FROM character WHERE profile = $p",
-            transaction, ("$p", profile));
+            "SELECT game_id, area, difficulty, updated_at, area_entered_at FROM character WHERE id = $c",
+            transaction, ("$c", characterId));
         using var reader = command.ExecuteReader();
-        if (!reader.Read()) return null;
+        if (!reader.Read()) throw new InvalidOperationException($"Character row {characterId} vanished");
 
         return new Cursor(
             reader.GetString(0),
@@ -462,13 +592,7 @@ public sealed partial class CaptureStore : IDisposable
             reader.IsDBNull(4) ? null : reader.GetInt64(4));
     }
 
-    private Cursor InsertCharacter(string profile, SqliteTransaction transaction)
-    {
-        Execute("INSERT INTO character (profile) VALUES ($p)", transaction, ("$p", profile));
-        return new Cursor("", 0, null, 0, null);
-    }
-
-    private Cursor ApplyIdentity(string profile, Identity identity, Cursor state,
+    private Cursor ApplyIdentity(long characterId, Identity identity, Cursor state,
         SqliteTransaction transaction)
     {
         Execute(
@@ -476,10 +600,10 @@ public sealed partial class CaptureStore : IDisposable
             UPDATE character
                SET account = $account, realm = $realm, difficulty = $difficulty,
                    char_flags = $flags, ladder = $ladder
-             WHERE profile = $p
+             WHERE id = $c
             """,
             transaction,
-            ("$p", profile),
+            ("$c", characterId),
             ("$account", identity.Account),
             ("$realm", identity.Realm),
             ("$difficulty", identity.Difficulty),
@@ -495,7 +619,7 @@ public sealed partial class CaptureStore : IDisposable
     /// each be absent while the others are present. <see cref="ApplyMerc" /> is the same shape
     /// against the merc's own row.
     /// </summary>
-    private Cursor ApplyPlayer(string profile, Unit wearer, Cursor state,
+    private Cursor ApplyPlayer(long characterId, Unit wearer, Cursor state,
         SqliteTransaction transaction)
     {
         // The unit document rides one fingerprint on the engine side, so `name` being PRESENT
@@ -504,74 +628,75 @@ public sealed partial class CaptureStore : IDisposable
         // would silently rewrite the character. Testing presence rather than the value matters —
         // the producer can send an empty name while the client has not resolved one, and reading
         // that as "no document" would throw away a real area, hand, class and skill update.
+        //
+        // The name itself is not written here: it is half of the row's key, and ResolveCharacter
+        // already chose the row by it.
         const int owner = CaptureSchema.OwnerPlayer;
         if (wearer.HasName)
         {
             Execute(
                 """
                 UPDATE character
-                   SET char_name = $name, char_class = $class, flags_ex = $flagsEx,
-                       area = $area, hand = $hand
-                 WHERE profile = $p
+                   SET char_class = $class, flags_ex = $flagsEx, area = $area, hand = $hand
+                 WHERE id = $c
                 """,
                 transaction,
-                ("$p", profile),
-                ("$name", wearer.Name),
+                ("$c", characterId),
                 ("$class", wearer.ClassId),
                 ("$flagsEx", (long)wearer.FlagsEx),
                 ("$area", wearer.Area),
                 ("$hand", wearer.Hand));
 
-            ReplaceSkills(profile, owner, wearer.Skills, transaction);
+            ReplaceSkills(characterId, owner, wearer.Skills, transaction);
             state = state with { Area = wearer.Area };
         }
 
         if (wearer.Stats.Count > 0)
         {
-            ReplaceStats(profile, owner, wearer.Stats, transaction);
+            ReplaceStats(characterId, owner, wearer.Stats, transaction);
 
             var level = wearer.Stats.FirstOrDefault(s => s.Id == StatLevel);
             if (level != null)
             {
-                Execute("UPDATE character SET level = $level WHERE profile = $p", transaction,
-                    ("$p", profile), ("$level", level.Value));
+                Execute("UPDATE character SET level = $level WHERE id = $c", transaction,
+                    ("$c", characterId), ("$level", level.Value));
             }
         }
 
-        ReplaceContainers(profile, owner, wearer.Containers, transaction);
+        ReplaceContainers(characterId, owner, wearer.Containers, transaction);
         return state;
     }
 
     /// <summary>The mercenary wearer. Presence rules exactly as <see cref="ApplyPlayer" />.</summary>
-    private void ApplyMerc(string profile, Unit merc, SqliteTransaction transaction)
+    private void ApplyMerc(long characterId, Unit merc, SqliteTransaction transaction)
     {
         if (merc.HasName)
         {
             Execute(
                 """
-                INSERT INTO merc (profile, name, class_id, flags_ex) VALUES ($p, $name, $class, $flagsEx)
-                ON CONFLICT(profile) DO UPDATE SET name = $name, class_id = $class, flags_ex = $flagsEx
+                INSERT INTO merc (character_id, name, class_id, flags_ex) VALUES ($c, $name, $class, $flagsEx)
+                ON CONFLICT(character_id) DO UPDATE SET name = $name, class_id = $class, flags_ex = $flagsEx
                 """,
                 transaction,
-                ("$p", profile),
+                ("$c", characterId),
                 ("$name", merc.Name),
                 ("$class", merc.ClassId),
                 ("$flagsEx", (long)merc.FlagsEx));
 
-            ReplaceSkills(profile, CaptureSchema.OwnerMerc, merc.Skills, transaction);
+            ReplaceSkills(characterId, CaptureSchema.OwnerMerc, merc.Skills, transaction);
         }
 
-        if (merc.Stats.Count > 0) ReplaceStats(profile, CaptureSchema.OwnerMerc, merc.Stats, transaction);
-        ReplaceContainers(profile, CaptureSchema.OwnerMerc, merc.Containers, transaction);
+        if (merc.Stats.Count > 0) ReplaceStats(characterId, CaptureSchema.OwnerMerc, merc.Stats, transaction);
+        ReplaceContainers(characterId, CaptureSchema.OwnerMerc, merc.Containers, transaction);
     }
 
-    private void DismissMerc(string profile, SqliteTransaction transaction)
+    private void DismissMerc(long characterId, SqliteTransaction transaction)
     {
-        Execute("DELETE FROM merc WHERE profile = $p", transaction, ("$p", profile));
+        Execute("DELETE FROM merc WHERE character_id = $c", transaction, ("$c", characterId));
         foreach (var table in new[] { "container", "wearer_stat", "wearer_skill" })
         {
-            Execute($"DELETE FROM {table} WHERE profile = $p AND owner = $o", transaction,
-                ("$p", profile), ("$o", CaptureSchema.OwnerMerc));
+            Execute($"DELETE FROM {table} WHERE character_id = $c AND owner = $o", transaction,
+                ("$c", characterId), ("$o", CaptureSchema.OwnerMerc));
         }
     }
 
@@ -589,22 +714,22 @@ public sealed partial class CaptureStore : IDisposable
     /// nothing at all, so a snapshot where only experience moved dirties what experience touches
     /// and no more.
     /// </summary>
-    private void ReplaceStats(string profile, int owner, IReadOnlyList<Stat> stats,
+    private void ReplaceStats(long characterId, int owner, IReadOnlyList<Stat> stats,
         SqliteTransaction transaction)
     {
         foreach (var stat in stats)
         {
             ExecutePrepared(
                 """
-                INSERT INTO wearer_stat (profile, owner, stat_id, value) VALUES ($p, $o, $id, $v)
-                ON CONFLICT(profile, owner, stat_id) DO UPDATE SET value = $v WHERE value IS NOT $v
+                INSERT INTO wearer_stat (character_id, owner, stat_id, value) VALUES ($c, $o, $id, $v)
+                ON CONFLICT(character_id, owner, stat_id) DO UPDATE SET value = $v WHERE value IS NOT $v
                 """,
-                transaction, ("$p", profile), ("$o", owner), ("$id", stat.Id), ("$v", stat.Value));
+                transaction, ("$c", characterId), ("$o", owner), ("$id", stat.Id), ("$v", stat.Value));
         }
 
         // The producer's stat list is a fixed curated set, so in practice this removes nothing —
         // but an upsert cannot retract, and without it a shrinking set would leave rows behind.
-        Prune("wearer_stat", "stat_id", profile, owner, stats.Select(s => s.Id), transaction);
+        Prune("wearer_stat", "stat_id", characterId, owner, stats.Select(s => s.Id), transaction);
     }
 
     /// <summary>
@@ -612,24 +737,24 @@ public sealed partial class CaptureStore : IDisposable
     /// is load-bearing rather than defensive. A skill list is not fixed: gear grants skills, so
     /// unequipping the item that granted one has to remove it, and an upsert alone never can.
     /// </summary>
-    private void ReplaceSkills(string profile, int owner, IReadOnlyList<Skill> skills,
+    private void ReplaceSkills(long characterId, int owner, IReadOnlyList<Skill> skills,
         SqliteTransaction transaction)
     {
         foreach (var skill in skills)
         {
             ExecutePrepared(
                 """
-                INSERT INTO wearer_skill (profile, owner, skill_id, hard_points, level)
-                VALUES ($p, $o, $id, $hard, $level)
-                ON CONFLICT(profile, owner, skill_id) DO UPDATE
+                INSERT INTO wearer_skill (character_id, owner, skill_id, hard_points, level)
+                VALUES ($c, $o, $id, $hard, $level)
+                ON CONFLICT(character_id, owner, skill_id) DO UPDATE
                     SET hard_points = $hard, level = $level
                     WHERE hard_points IS NOT $hard OR level IS NOT $level
                 """,
-                transaction, ("$p", profile), ("$o", owner), ("$id", skill.SkillId),
+                transaction, ("$c", characterId), ("$o", owner), ("$id", skill.SkillId),
                 ("$hard", skill.HardPoints), ("$level", skill.Level));
         }
 
-        Prune("wearer_skill", "skill_id", profile, owner, skills.Select(s => s.SkillId), transaction);
+        Prune("wearer_skill", "skill_id", characterId, owner, skills.Select(s => s.SkillId), transaction);
     }
 
     /// <summary>
@@ -637,11 +762,11 @@ public sealed partial class CaptureStore : IDisposable
     /// cannot express. Costs nothing when it matches nothing: a DELETE that removes no row dirties
     /// no page, so on the common path this is a read.
     /// </summary>
-    private void Prune(string table, string keyColumn, string profile, int owner,
+    private void Prune(string table, string keyColumn, long characterId, int owner,
         IEnumerable<int> reported, SqliteTransaction transaction)
     {
         var keys = reported.ToList();
-        var parameters = new List<(string, object?)> { ("$p", profile), ("$o", owner) };
+        var parameters = new List<(string, object?)> { ("$c", characterId), ("$o", owner) };
         parameters.AddRange(keys.Select((key, i) => ($"$k{i}", (object?)key)));
 
         // NOT IN () is a syntax error rather than "everything", so an empty report clears instead.
@@ -649,7 +774,7 @@ public sealed partial class CaptureStore : IDisposable
             ? ""
             : $" AND {keyColumn} NOT IN ({string.Join(", ", keys.Select((_, i) => $"$k{i}"))})";
 
-        Execute($"DELETE FROM {table} WHERE profile = $p AND owner = $o{filter}", transaction,
+        Execute($"DELETE FROM {table} WHERE character_id = $c AND owner = $o{filter}", transaction,
             parameters.ToArray());
     }
 
@@ -658,11 +783,11 @@ public sealed partial class CaptureStore : IDisposable
     /// whichever difficulty the character is currently in, so rows for the others must survive —
     /// that is what lets progression accumulate across all three over a character's life.
     /// </summary>
-    private void ApplyProgression(string profile, int difficulty, Progression progression,
+    private void ApplyProgression(long characterId, int difficulty, Progression progression,
         SqliteTransaction transaction)
     {
-        Execute("DELETE FROM progression WHERE profile = $p AND difficulty = $d", transaction,
-            ("$p", profile), ("$d", difficulty));
+        Execute("DELETE FROM progression WHERE character_id = $c AND difficulty = $d", transaction,
+            ("$c", characterId), ("$d", difficulty));
 
         void Insert(int kind, IEnumerable<int> ids)
         {
@@ -670,10 +795,10 @@ public sealed partial class CaptureStore : IDisposable
             {
                 ExecutePrepared(
                     """
-                    INSERT OR IGNORE INTO progression (profile, difficulty, kind, entry_id)
-                    VALUES ($p, $d, $k, $id)
+                    INSERT OR IGNORE INTO progression (character_id, difficulty, kind, entry_id)
+                    VALUES ($c, $d, $k, $id)
                     """,
-                    transaction, ("$p", profile), ("$d", difficulty), ("$k", kind), ("$id", id));
+                    transaction, ("$c", characterId), ("$d", difficulty), ("$k", kind), ("$id", id));
             }
         }
 
@@ -685,7 +810,7 @@ public sealed partial class CaptureStore : IDisposable
     /// Kills arrive as the delta since the engine's last send — it clears its own tally on send —
     /// so they are added to the stored lifetime totals rather than replacing them.
     /// </summary>
-    private void ApplyKills(string profile, int difficulty, Kills kills, SqliteTransaction transaction)
+    private void ApplyKills(long characterId, int difficulty, Kills kills, SqliteTransaction transaction)
     {
         void Accumulate(bool superUnique, IEnumerable<Kill> entries)
         {
@@ -694,12 +819,12 @@ public sealed partial class CaptureStore : IDisposable
                 if (entry.Count <= 0) continue;
                 ExecutePrepared(
                     """
-                    INSERT INTO kill (profile, difficulty, super_unique, entry_id, spec, count)
-                    VALUES ($p, $d, $su, $id, $spec, $count)
-                    ON CONFLICT(profile, difficulty, super_unique, entry_id, spec)
+                    INSERT INTO kill (character_id, difficulty, super_unique, entry_id, spec, count)
+                    VALUES ($c, $d, $su, $id, $spec, $count)
+                    ON CONFLICT(character_id, difficulty, super_unique, entry_id, spec)
                     DO UPDATE SET count = count + $count
                     """,
-                    transaction, ("$p", profile), ("$d", difficulty), ("$su", superUnique ? 1 : 0),
+                    transaction, ("$c", characterId), ("$d", difficulty), ("$su", superUnique ? 1 : 0),
                     ("$id", entry.Id), ("$spec", superUnique ? 0 : entry.Spec), ("$count", entry.Count));
             }
         }
@@ -708,22 +833,22 @@ public sealed partial class CaptureStore : IDisposable
         Accumulate(true, kills.BySuperUnique);
     }
 
-    private void AccrueAreaTime(string profile, int difficulty, int area, long deltaMs,
+    private void AccrueAreaTime(long characterId, int difficulty, int area, long deltaMs,
         SqliteTransaction transaction)
     {
         Execute(
             """
-            INSERT INTO area_time (profile, difficulty, area, milliseconds) VALUES ($p, $d, $a, $ms)
-            ON CONFLICT(profile, difficulty, area) DO UPDATE SET milliseconds = milliseconds + $ms
+            INSERT INTO area_time (character_id, difficulty, area, milliseconds) VALUES ($c, $d, $a, $ms)
+            ON CONFLICT(character_id, difficulty, area) DO UPDATE SET milliseconds = milliseconds + $ms
             """,
-            transaction, ("$p", profile), ("$d", difficulty), ("$a", area), ("$ms", deltaMs));
+            transaction, ("$c", characterId), ("$d", difficulty), ("$a", area), ("$ms", deltaMs));
     }
 
     // -----------------------------------------------------------------------
     // Containers and items
     // -----------------------------------------------------------------------
 
-    private void ReplaceContainers(string profile, int owner, Containers? containers,
+    private void ReplaceContainers(long characterId, int owner, Containers? containers,
         SqliteTransaction transaction)
     {
         if (containers == null) return;
@@ -766,30 +891,30 @@ public sealed partial class CaptureStore : IDisposable
         // A container arrives only when its contents changed, and it arrives whole, so everything
         // under that name goes and is rebuilt. Cascades through item/statlist/stat.
         void Clear(string name) =>
-            ExecutePrepared("DELETE FROM container WHERE profile = $p AND owner = $o AND name = $n",
-                transaction, ("$p", profile), ("$o", owner), ("$n", name));
+            ExecutePrepared("DELETE FROM container WHERE character_id = $c AND owner = $o AND name = $n",
+                transaction, ("$c", characterId), ("$o", owner), ("$n", name));
 
         void Insert(string name, string label, StashTabKind stashKind, StashTabType stashType, int page,
             uint gold, int width, int height, IEnumerable<Unit> items, bool slotIndexed)
         {
             // OR REPLACE for the same reason as ReplaceStats, and here the hazard is closer: the
-            // stash inserts one row per page under a UNIQUE(profile, owner, name, stash_kind, page),
-            // so two pages arriving with the same kind and index would otherwise abort the whole
-            // snapshot — identity, kills and area time with it — and keep doing so on every later
-            // send. The superseded row cascades its items away, which is the right outcome: last
-            // wins.
+            // stash inserts one row per page under a UNIQUE(character_id, owner, name, stash_kind,
+            // page), so two pages arriving with the same kind and index would otherwise abort the
+            // whole snapshot — identity, kills and area time with it — and keep doing so on every
+            // later send. The superseded row cascades its items away, which is the right outcome:
+            // last wins.
             var containerId = InsertReturningId(
                 """
                 INSERT OR REPLACE INTO container
-                    (profile, owner, name, label, stash_kind, stash_type, page, gold, width, height)
-                VALUES ($p, $o, $n, $l, $k, $t, $pg, $g, $w, $h)
+                    (character_id, owner, name, label, stash_kind, stash_type, page, gold, width, height)
+                VALUES ($c, $o, $n, $l, $k, $t, $pg, $g, $w, $h)
                 RETURNING id
                 """,
-                transaction, ("$p", profile), ("$o", owner), ("$n", name), ("$l", label),
+                transaction, ("$c", characterId), ("$o", owner), ("$n", name), ("$l", label),
                 ("$k", (int)stashKind), ("$t", (int)stashType), ("$pg", page), ("$g", (long)gold),
                 ("$w", width), ("$h", height));
 
-            InsertItems(new ItemTarget(containerId, profile, transaction), items, width, height,
+            InsertItems(new ItemTarget(containerId, characterId, transaction), items, width, height,
                 slotIndexed);
 
             // Every top-level item in this container is its own root, settled in one statement
@@ -804,7 +929,7 @@ public sealed partial class CaptureStore : IDisposable
     /// as one value rather than as three parameters re-threaded through every frame.
     /// </summary>
     private readonly record struct ItemTarget(
-        long ContainerId, string Profile, SqliteTransaction Transaction);
+        long ContainerId, long CharacterId, SqliteTransaction Transaction);
 
     /// <summary>
     /// A socket filler's place in its host; absent for a top-level item, which has no parent, no
@@ -870,7 +995,7 @@ public sealed partial class CaptureStore : IDisposable
         var id = InsertReturningIdPrepared(
             """
             INSERT INTO item (
-                container_id, parent_id, root_id, socket_index, profile, gid, unit_type, class_id, code,
+                container_id, parent_id, root_id, socket_index, character_id, gid, unit_type, class_id, code,
                 quality, item_flags, format, file_index, item_level, rare_prefix, rare_suffix, auto_affix,
                 magic_prefix_0, magic_prefix_1, magic_prefix_2,
                 magic_suffix_0, magic_suffix_1, magic_suffix_2,
@@ -880,7 +1005,7 @@ public sealed partial class CaptureStore : IDisposable
                 damage_1h_min, damage_1h_max, damage_2h_min, damage_2h_max,
                 damage_throw_min, damage_throw_max)
             VALUES (
-                $container, $parent, $root, $socket, $profile, $gid, $unitType, $classId, $code,
+                $container, $parent, $root, $socket, $character, $gid, $unitType, $classId, $code,
                 $quality, $itemFlags, $format, $fileIndex, $itemLevel, $rarePrefix, $rareSuffix, $autoAffix,
                 $prefix0, $prefix1, $prefix2, $suffix0, $suffix1, $suffix2,
                 $earLevel, $playerName, $gfxIndex, $title,
@@ -894,7 +1019,7 @@ public sealed partial class CaptureStore : IDisposable
             ("$parent", placement?.ParentId),
             ("$root", placement?.RootId ?? 0),
             ("$socket", placement?.Index),
-            ("$profile", target.Profile),
+            ("$character", target.CharacterId),
             ("$gid", (long)item.Gid),
             ("$unitType", item.UnitType),
             ("$classId", item.ClassId),

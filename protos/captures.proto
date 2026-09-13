@@ -22,14 +22,21 @@ import "google/protobuf/timestamp.proto";
 // selector has to stay live as bots report, which a pull cannot do without polling.
 service CaptureService {
   // One character, whole: both wearers with every container, item, stat list and socket filler.
-  rpc GetCharacter(ProfileRequest) returns (Character);
+  rpc GetCharacter(CharacterKey) returns (Character);
 
   // Items matching stat/quality/code filters, across one or all characters.
   rpc SearchItems(SearchItemsRequest) returns (SearchItemsResponse);
 
   // Clear accumulated analytics for one character.
-  rpc ResetKills(ProfileRequest) returns (google.protobuf.Empty);
-  rpc ResetAreaTime(ProfileRequest) returns (google.protobuf.Empty);
+  rpc ResetKills(CharacterKey) returns (google.protobuf.Empty);
+  rpc ResetAreaTime(CharacterKey) returns (google.protobuf.Empty);
+
+  // Drop one character's capture entirely — every container, item, total and the row itself.
+  // The only way a capture leaves the store: a profile's deletion deliberately leaves its
+  // characters in place (the items still exist on the account), so a character that is gone for
+  // good — deleted in game, expired, a mule that was emptied and abandoned — is forgotten by hand.
+  // Announced as a fresh CapturesSnapshot, since the list has one entry fewer.
+  rpc ForgetCharacter(CharacterKey) returns (google.protobuf.Empty);
 }
 
 // ---------------------------------------------------------------------------
@@ -300,8 +307,20 @@ message Kills {
 // Stored / served
 // ---------------------------------------------------------------------------
 
-message ProfileRequest {
-  string profile = 1;  // owning profile name
+// What identifies a capture: the profile it was reported through AND the character's name.
+//
+// The pair, not the profile alone, because one profile can play several characters — a mule
+// profile logs into each of its mules in turn — and keying on the profile made every character
+// overwrite the last, which for the mules a reader most wants to search was the worst possible
+// place to forget. Not the account/realm/name triple either: open Battle.net and single player
+// report no account, so the profile is the one owner the manager always knows. A character
+// played through two profiles is therefore two captures, which is honest — the manager saw it
+// twice — and the stale one ages out or is forgotten by hand.
+//
+// Renaming a profile carries its captures along; deleting one leaves them in place.
+message CharacterKey {
+  string profile = 1;  // the profile the capture was reported through
+  string name = 2;     // character name; empty only for a capture that never named itself
 }
 
 // Enough to populate a character selector, and nothing more — no stats, no skills, no gear.
@@ -309,14 +328,13 @@ message ProfileRequest {
 // value is genuinely absent, not "the endpoint you called does not send it". `level` is the one
 // denormalisation, so a selector rendering "Sorc — 90" need not pull an entire capture for it.
 message CharacterSummary {
-  string profile = 1;  // KEY: owning profile name
+  CharacterKey key = 1;  // profile and character name
   Identity identity = 2;
 
-  string name = 3;      // character name
-  int32 class_id = 4;   // D2 class id (0 Amazon, 1 Sorceress, ... 6 Assassin)
-  int32 level = 5;
+  int32 class_id = 3;   // D2 class id (0 Amazon, 1 Sorceress, ... 6 Assassin)
+  int32 level = 4;
 
-  google.protobuf.Timestamp updated_at = 6;  // last snapshot received; the freshness signal
+  google.protobuf.Timestamp updated_at = 5;  // last snapshot received; the freshness signal
 }
 
 // A captured character: the manager's own facts, wrapped around the wearers themselves.
@@ -327,7 +345,7 @@ message CharacterSummary {
 // difficulty it was seen on, and the totals the manager accumulates across sessions. Nothing
 // derived is stored either (level is stat 12; hardcore/expansion are char_flags bits).
 message Character {
-  string profile = 1;  // KEY: owning profile name
+  CharacterKey key = 1;  // profile and character name; player.name restates the latter
 
   Identity identity = 2;  // account, realm, difficulty, char_flags, ladder
 
@@ -415,10 +433,15 @@ message SearchItemsRequest {
   // ---- identity. AND-ed with each other and with the stat conditions; each repeated field ORs
   // within itself, and empty means "no filter".
 
-  // Which characters to search, by owning profile name. Empty = every character. Repeated because
-  // the question a reader asks of a bot farm is usually about a SET of mules rather than one or
-  // all of them, and narrowing to one at a time cannot express it.
+  // Which characters to search. Both empty = every character. Repeated because the question a
+  // reader asks of a bot farm is usually about a SET of mules rather than one or all of them, and
+  // narrowing to one at a time cannot express it.
+  //
+  // Two grains, OR-ed together: a profile names every character captured through it (the whole
+  // of a mule profile), a key names exactly one. Naming a profile AND one of its characters is
+  // therefore the profile — the finer pick adds nothing to a set it is already in.
   repeated string profiles = 1;
+  repeated CharacterKey characters = 2;
   //
   // No `codes` field: a base item is named by its items.txt ROW below rather than by its code,
   // which is the same axis said twice — and the row is what a capture stores, so the code would
@@ -769,7 +792,7 @@ message SearchItemsResponse {
 }
 
 message ItemMatch {
-  string profile = 1;
+  CharacterKey character = 1;   // the capture the item sits in
   Owner owner = 2;
   string container = 3;         // container name the item sits in
   StashTabKind stash_kind = 4;  // which stash, when `container` is "stash"; PERSONAL otherwise

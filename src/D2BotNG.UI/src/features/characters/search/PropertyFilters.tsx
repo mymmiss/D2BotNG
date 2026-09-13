@@ -15,7 +15,13 @@ import { useMemo } from "react";
 import type { TooltipEngine } from "d2itemtoolkit";
 import { ItemSprite } from "@/lib/rendering";
 import { colorForQuality } from "@/features/items/item-utils";
-import { SocketScope, Tier } from "@/generated/captures_pb";
+import {
+  SocketScope,
+  Tier,
+  type CharacterKey,
+  type CharacterSummary,
+} from "@/generated/captures_pb";
+import { captureMapKey } from "@/stores/event-store";
 import {
   IDENTIFIED_FLAG,
   RUNEWORD_FLAG,
@@ -380,19 +386,84 @@ const PICK_COLORS: Record<SpecificPick["kind"], string> = {
   runeword: colorForQuality(7),
 };
 
+/**
+ * One row of the "Character" picker: a whole profile, or one capture under it. Exactly one of
+ * `profile` / `key` is set — that is which of the request's two filters the row feeds. `id` is
+ * the widget's own key for the row and nothing more.
+ */
+interface WherePick {
+  id: string;
+  name: string;
+  profile?: string;
+  key?: CharacterKey;
+}
+
+/**
+ * The rows: every profile with captures, and under a profile holding several — a mule profile —
+ * each of its characters as well, so one mule can be picked out of the twenty the profile has
+ * used. A profile holding one capture is one row, since naming the character would add nothing.
+ */
+function whereOptions(characters: CharacterSummary[]): WherePick[] {
+  const byProfile = new Map<string, CharacterKey[]>();
+  for (const c of characters) {
+    if (!c.key) continue;
+    const keys = byProfile.get(c.key.profile) ?? [];
+    keys.push(c.key);
+    byProfile.set(c.key.profile, keys);
+  }
+
+  const out: WherePick[] = [];
+  for (const [profile, keys] of [...byProfile].sort(([a], [b]) =>
+    a.localeCompare(b),
+  )) {
+    out.push({
+      id: profile,
+      name: keys.length > 1 ? `${profile} (all ${keys.length})` : profile,
+      profile,
+    });
+    if (keys.length > 1) {
+      for (const key of [...keys].sort((a, b) =>
+        a.name.localeCompare(b.name),
+      )) {
+        out.push({
+          id: captureMapKey(key),
+          name: `${key.name} · ${profile}`,
+          key,
+        });
+      }
+    }
+  }
+  return out;
+}
+
 export function PropertyFilterPanel({
   filters,
   onChange,
-  profiles,
+  characters,
   engine,
 }: {
   filters: Filters;
   onChange: (next: Filters) => void;
-  profiles: string[];
+  /** Every capture the store holds; the picker groups them by profile. */
+  characters: CharacterSummary[];
   engine: TooltipEngine | null;
 }) {
   const { items, types } = useItemTaxonomy(engine);
   const patch = (next: Partial<Filters>) => onChange({ ...filters, ...next });
+
+  const where = useMemo(() => whereOptions(characters), [characters]);
+  // The chosen rows, as the widget's ids: the profiles by name, the captures by their map key.
+  const whereChosen = [
+    ...filters.profiles,
+    ...filters.characters.map(captureMapKey),
+  ];
+  const patchWhere = (ids: string[]) => {
+    const picks = ids.flatMap((id) => where.find((w) => w.id === id) ?? []);
+    patch({
+      profiles: picks.flatMap((w) => (w.profile ? [w.profile] : [])),
+      characters: picks.flatMap((w) => (w.key ? [w.key] : [])),
+    });
+  };
   // A computed key widens to `string`, so the spread's type no longer names the field it set;
   // `RangeKey` is what checks that the key is one of the five, and the shape is fixed either way.
   const patchRange = (key: RangeKey, part: { min?: string; max?: string }) =>
@@ -498,9 +569,9 @@ export function PropertyFilterPanel({
               "all" is the empty selection rather than an option in the list, so there is no way to
               pick it alongside a name and mean two contradictory things. */}
           <IdSelect
-            options={profiles.map((p) => ({ id: p, name: p }))}
-            chosen={filters.profiles}
-            onChange={(ids) => patch({ profiles: ids })}
+            options={where}
+            chosen={whereChosen}
+            onChange={patchWhere}
             placeholder="All characters"
           />
         </Field>
